@@ -54,7 +54,7 @@ class SentinelDataset(torch.utils.data.Dataset):
 
 		bands = (bands - MEAN) / STDD
 
-		return bands,label
+		return bands,bands_augmented,label
 
 
 class FastSentinelDataset():

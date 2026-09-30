@@ -1,7 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.flop_counter import FlopCounterMode
 
+############################################################
+# CONV BLOCKS
+############################################################
 class ConvBlock(nn.Module):
 	def __init__(self,channels,depth=2):
 		super().__init__()
@@ -19,7 +23,9 @@ class ConvBlock(nn.Module):
 			out = layer(out)
 		return x + out
 
-
+############################################################
+# ATTENTION BLOCKS
+############################################################
 class MultiHeadSelfAttention(nn.Module):
 	'''
 	Multi-head Self-Attention
@@ -109,92 +115,9 @@ class ViTBlock(nn.Module):
 		return tokens.reshape(B,H,W,C).permute(0,3,1,2)
 
 
-class Projector(nn.Module):
-	'''
-	Barlow Twins projector.
-	'''
-	def __init__(self,D):
-		super().__init__()
-		self.layers = nn.Sequential(
-			nn.Linear(D, 2048),
-			nn.BatchNorm1d(2048),
-			nn.ReLU(),
-			nn.Linear(2048, 2048) # Final projection dimension
-		)
-	def forward(self,x):
-		return self.layers(x)
-
-
-class MaskDownsampler(nn.Module):
-	'''
-	Calculate average over a 31x31 area of pixels in masks. 
-	This converts a 256x256 mask into a 16x16 tensor, keeping correct relative 
-	pixel positions for direct comparison to output embeddings.
-	
-	'''
-	def __init__(self):
-		# [B,1,256,256] -> [B,1,16,16]
-		self.downsampler = nn.AvgPool2d(kernel_size=31,stride=16,padding=15)
-
-	def forward(self,x)
-		return self.downsample(x) #i.e. targets
-
-
-class HealthVariablePredictorHead(nn.Module):
-
-	def __init__(self,embedding_dim=512):
-		super().__init__()
-		# A 1x1 convolution/linear regression head over each 16x16 cell
-		self.predict_head = nn.Sequential(
-			nn.Conv2d(embedding_dim, 128, kernel_size=1),
-			nn.ReLU(),
-			nn.Conv2d(128, 1, kernel_size=1)
-		)
-
-	def forward(self,x):
-		return self.predict_head(x)
-
-
-class MaskedSpatialDownsampler:
-	'''
-	Might need masking?
-	'''
-	def __init__(self, kernel_size=31, stride=16, padding=15):
-		self.kernel_size = kernel_size
-		self.stride = stride
-		self.padding = padding
-
-		# Create a fixed uniform weight kernel for local summing
-		# Shape: (1, 1, K, K) filled with 1.0
-		self.weight = torch.ones((1, 1, kernel_size, kernel_size))
-
-	def __call__(self, health_map_256):
-		# Move the weight kernel to the same device as your input data
-		weight = self.weight.to(health_map_256.device)
-
-		# 1. Create a binary mask where valid data coverage exists
-		# 1.0 means valid data, 0.0 means missing coverage area
-		mask = (health_map_256 != 0.0).float()
-
-		# 2. Local sum of actual health values within the receptive field
-		# We zero out any background noise just in case by multiplying by mask
-		masked_health = health_map_256 * mask
-		sum_health = F.conv2d(masked_health, weight, stride=self.stride, padding=self.padding)
-
-		# 3. Local count of valid pixels within the receptive field
-		count_valid = F.conv2d(mask, weight, stride=self.stride, padding=self.padding)
-
-		# 4. Compute the true coverage average, avoiding division by zero
-		# If a neighborhood has 0 valid pixels, keep the result as 0.0
-		targets_downsampled = torch.where(
-			count_valid > 0, 
-			sum_health / (count_valid + 1e-8), 
-			torch.zeros_like(sum_health)
-		)
-
-	return targets_downsampled
-
-
+############################################################
+# ENCODERS
+############################################################
 class HybridEncoder(nn.Module):
 	'''
 	Default encoder.
@@ -238,9 +161,10 @@ class HybridEncoder(nn.Module):
 		return x
 
 
-class PureConvEncoder():
+class PureConvEncoder(nn.Module):
 
 	def __init__(self):
+		super().__init__()
 		pass
 
 
@@ -251,9 +175,10 @@ class PureConvEncoder():
 		return x
 
 
-class PureAttnEncoder():
+class PureAttnEncoder(nn.Module):
 
 	def __init__(self):
+		super().__init__()
 		pass
 
 
@@ -265,26 +190,76 @@ class PureAttnEncoder():
 
 		return x
 
+############################################################
+# BARLOW TWINS
+############################################################
+class Projector(nn.Module):
+	'''
+	Barlow Twins projector.
+	'''
+	def __init__(self,in_dim,out_dim=2048):
+		super().__init__()
+		self.layers = nn.Sequential(
+			nn.Linear(in_dim, out_dim),
+			nn.BatchNorm1d(out_dim),
+			nn.ReLU(),
+			nn.Linear(out_dim, out_dim) # Final projection dimension
+		)
+	def forward(self,x):
+		return self.layers(x)
+
+
+class BarlowTwinsLoss(nn.Module):
+	'''
+	L = sum_i (1 - C_ii)^2 + lambda * sum_i sum_{j!=i} C_ij^2
+	C is the cross-correlation matrix between the batch-standardized embeddings
+	of the two views. Computed in float32 regardless of autocast.
+	'''
+	def __init__(self,proj_dim,lambd=5e-3):
+		super().__init__()
+		self.lambd = lambd
+		self.bn    = nn.BatchNorm1d(proj_dim,affine=False,track_running_stats=False)
+
+	def forward(self,z1,z2):
+		with torch.autocast(device_type='cuda' if z1.is_cuda else 'cpu',enabled=False):
+			z1 = self.bn(z1.float())
+			z2 = self.bn(z2.float())
+			c  = z1.T @ z2 / z1.shape[0] # [D,D]
+
+			diag     = torch.diagonal(c)
+			on_diag  = (diag - 1).pow(2).sum()
+			off_diag = c.pow(2).sum() - diag.pow(2).sum()
+			loss     = on_diag + self.lambd * off_diag
+		return loss, on_diag.detach(), off_diag.detach()
+
+
 
 class SentinelBarlowTwins(nn.Module):
 	'''
 	Main class/entry point.
 	'''
 	def __init__(self,model_id,in_chan=12,block_chan=64,conv_per_block=2):
+		super().__init__()
 
+		# META
 		self.model_name = "S2BT"
 		self.model_id   = model_id
 
-		# Input channels projection
-		self.in_layer = nn.Conv2d(in_chan,block_chan)
+		# Input channels projection [B,S2 12-band,H,W] -> [B,block_chan,H,W] 
+		self.in_layer = nn.Conv2d(in_chan,block_chan,3,1,1,bias=True)
 
 		# ENCODERS
 		self.E1 = HybridEncoder(init_channels=block_chan,cnn_depth=conv_per_block)
 		self.E2 = HybridEncoder(init_channels=block_chan,cnn_depth=conv_per_block)
 
 		# PROJECTOR
-		self.projector1 = Projector(block_chan*16)
-		self.projector2 = Projector(block_chan*16)
+		proj_dim = 2048
+		self.projector1 = Projector(block_chan*16,proj_dim)
+		self.projector2 = Projector(block_chan*16,proj_dim)
+
+		# LOSS
+		lambd = 5e-3
+		self.loss = BarlowTwinsLoss(proj_dim,lambd)
 
 
 	def forward(self,x,x_aug):
@@ -300,6 +275,79 @@ class SentinelBarlowTwins(nn.Module):
 		augmented = self.projector2(augmented)
 
 		return normal,augmented
+
+
+############################################################
+# PREDICTION
+############################################################
+class MaskDownsampler(nn.Module):
+	'''
+	Calculate average over a 31x31 area of pixels in masks. 
+	This converts a 256x256 mask into a 16x16 tensor, keeping correct relative 
+	pixel positions for direct comparison to output embeddings.
+	
+	'''
+	def __init__(self):
+		# [B,1,256,256] -> [B,1,16,16]
+		self.downsampler = nn.AvgPool2d(kernel_size=31,stride=16,padding=15)
+
+	def forward(self,x)
+		return self.downsample(x) #i.e. targets
+
+
+class HealthVariablePredictorHead(nn.Module):
+
+	def __init__(self,embedding_dim=512):
+		super().__init__()
+		# A 1x1 convolution/linear regression head over each 16x16 cell
+		self.predict_head = nn.Sequential(
+			nn.Conv2d(embedding_dim, 128, kernel_size=1),
+			nn.ReLU(),
+			nn.Conv2d(128, 1, kernel_size=1)
+		)
+
+	def forward(self,x):
+		return self.predict_head(x)
+
+
+class MaskedSpatialDownsampler:
+	'''
+	Might need masking if data not adjusted.
+	'''
+	def __init__(self, kernel_size=31, stride=16, padding=15):
+		self.kernel_size = kernel_size
+		self.stride = stride
+		self.padding = padding
+
+		# Create a fixed uniform weight kernel for local summing
+		# Shape: (1, 1, K, K) filled with 1.0
+		self.weight = torch.ones((1, 1, kernel_size, kernel_size))
+
+	def __call__(self, health_map_256):
+		# Move the weight kernel to the same device as your input data
+		weight = self.weight.to(health_map_256.device)
+
+		# 1. Create a binary mask where valid data coverage exists
+		# 1.0 means valid data, 0.0 means missing coverage area
+		mask = (health_map_256 != 0.0).float()
+
+		# 2. Local sum of actual health values within the receptive field
+		# We zero out any background noise just in case by multiplying by mask
+		masked_health = health_map_256 * mask
+		sum_health = F.conv2d(masked_health, weight, stride=self.stride, padding=self.padding)
+
+		# 3. Local count of valid pixels within the receptive field
+		count_valid = F.conv2d(mask, weight, stride=self.stride, padding=self.padding)
+
+		# 4. Compute the true coverage average, avoiding division by zero
+		# If a neighborhood has 0 valid pixels, keep the result as 0.0
+		targets_downsampled = torch.where(
+			count_valid > 0, 
+			sum_health / (count_valid + 1e-8), 
+			torch.zeros_like(sum_health)
+		)
+
+	return targets_downsampled
 
 
 
