@@ -38,7 +38,7 @@ class MultiHeadSelfAttention(nn.Module):
 		super().__init__()
 
 		#dimensions
-		assert D % num_heads == 0, f"channels={E} not divisible by num_heads={num_heads}"
+		assert D % num_heads == 0, f"channels={D} not divisible by num_heads={num_heads}"
 		self.D         = D
 		self.num_heads = num_heads
 		self.H         = D // num_heads
@@ -122,21 +122,21 @@ class HybridEncoder(nn.Module):
 	'''
 	Default encoder.
 	'''
-	def __init__(self,init_channels=64,cnn_depth=2):
+	def __init__(self,init_channels=64,cnn_layers=2):
 		super().__init__()
 
 		down_params = {'kernel_size': 3, 'stride': 2, 'padding': 1, 'bias': True}
 
-		self.conv1 = ConvBlock(channels=init_channels,depth=cnn_depth)
+		self.conv1 = ConvBlock(channels=init_channels,depth=cnn_layers)
 		self.down1 = nn.Conv2d(init_channels,init_channels*2,**down_params)
 
-		self.conv2 = ConvBlock(channels=init_channels*2,depth=cnn_depth)
+		self.conv2 = ConvBlock(channels=init_channels*2,depth=cnn_layers)
 		self.down2 = nn.Conv2d(init_channels*2,init_channels*4,**down_params)
 
-		self.conv3 = ConvBlock(channels=init_channels*4,depth=cnn_depth)
+		self.conv3 = ConvBlock(channels=init_channels*4,depth=cnn_layers)
 		self.down3 = nn.Conv2d(init_channels*4,init_channels*8,**down_params)
 
-		self.conv4 = ConvBlock(channels=init_channels*8,depth=cnn_depth)
+		self.conv4 = ConvBlock(channels=init_channels*8,depth=cnn_layers)
 		self.down4 = nn.Conv2d(init_channels*8,init_channels*16,**down_params)
 
 		self.attn1 = ViTLayer(init_channels*16,num_heads=16,mlp_ratio=4)
@@ -158,37 +158,83 @@ class HybridEncoder(nn.Module):
 		x = self.attn2(x)
 
 		# RETURN [B,N,D]
-		return x
+		# return x
+
+		# RETURN [B,C,H,W]
+		return x.reshape(B,H,W,C).permute(0,3,1,2)
 
 
 class PureConvEncoder(nn.Module):
-
-	def __init__(self):
+	'''
+	Same conv backbone as HybridEncoder, without the attention layers.
+	'''
+	def __init__(self,init_channels=64,cnn_depth=2):
 		super().__init__()
-		pass
+
+		down_params = {'kernel_size': 3, 'stride': 2, 'padding': 1, 'bias': True}
+
+		self.conv1 = ConvBlock(channels=init_channels,depth=cnn_depth)
+		self.down1 = nn.Conv2d(init_channels,init_channels*2,**down_params)
+
+		self.conv2 = ConvBlock(channels=init_channels*2,depth=cnn_depth)
+		self.down2 = nn.Conv2d(init_channels*2,init_channels*4,**down_params)
+
+		self.conv3 = ConvBlock(channels=init_channels*4,depth=cnn_depth)
+		self.down3 = nn.Conv2d(init_channels*4,init_channels*8,**down_params)
+
+		self.conv4 = ConvBlock(channels=init_channels*8,depth=cnn_depth)
+		self.down4 = nn.Conv2d(init_channels*8,init_channels*16,**down_params)
+
+		self.conv5 = ConvBlock(channels=init_channels*16,depth=cnn_depth)
 
 
 	def forward(self,x):
 		# CONV LAYERS
+		x = self.down1(self.conv1(x))
+		x = self.down2(self.conv2(x))
+		x = self.down3(self.conv3(x))
+		x = self.down4(self.conv4(x))
+		x = self.conv5(x)
 
 		# [B,C,H,W] -> [B,H*W,C]
+		# B,C,H,W = x.shape
+		# return x.permute(0,2,3,1).reshape(B,H*W,C)
+
 		return x
 
 
 class PureAttnEncoder(nn.Module):
-
-	def __init__(self):
+	'''
+	Plain ViT: 16x16 patch embedding + learned positional embedding + ViT layers.
+	Same output grid/dim as the other encoders (256x256 -> 16x16 tokens of init_channels*16).
+	'''
+	def __init__(self,init_channels=64,img_size=256,patch_size=16,depth=6,num_heads=16,mlp_ratio=4):
 		super().__init__()
-		pass
+		D = init_channels*16
+		N = (img_size // patch_size)**2
+
+		self.patch_embed = nn.Conv2d(init_channels,D,kernel_size=patch_size,stride=patch_size,bias=True)
+		self.pos_embed   = nn.Parameter(torch.zeros(1,N,D))
+		nn.init.trunc_normal_(self.pos_embed,std=0.02)
+
+		self.layers = nn.ModuleList([ViTLayer(D,num_heads,mlp_ratio) for _ in range(depth)])
+		self.norm   = nn.LayerNorm(D)
 
 
 	def forward(self,x):
 
-		# PATCH EMBED
+		# PATCH EMBED [B,C,H,W] -> [B,N,D]
+		x = self.patch_embed(x)
+		B,D,H,W = x.shape
+		x = x.permute(0,2,3,1).reshape(B,H*W,D)
+		x = x + self.pos_embed
 
 		# ATTENTION LAYERS
+		for layer in self.layers:
+			x = layer(x)
 
-		return x
+		return self.norm(x)
+
 
 ############################################################
 # BARLOW TWINS
@@ -238,7 +284,7 @@ class SentinelBarlowTwins(nn.Module):
 	'''
 	Main class/entry point.
 	'''
-	def __init__(self,model_id,in_chan=12,block_chan=64,conv_per_block=2):
+	def __init__(self,model_id,bands=10,init_chan=64,cnn_layers=2,proj_dim=1024):
 		super().__init__()
 
 		# META
@@ -246,35 +292,35 @@ class SentinelBarlowTwins(nn.Module):
 		self.model_id   = model_id
 
 		# Input channels projection [B,S2 12-band,H,W] -> [B,block_chan,H,W] 
-		self.in_layer = nn.Conv2d(in_chan,block_chan,3,1,1,bias=True)
+		self.in_layer = nn.Conv2d(bands,init_chan,3,1,1,bias=True)
 
-		# ENCODERS
-		self.E1 = HybridEncoder(init_channels=block_chan,cnn_depth=conv_per_block)
-		self.E2 = HybridEncoder(init_channels=block_chan,cnn_depth=conv_per_block)
+		# ENCODER (shared by both views, as in Barlow Twins)
+		self.encoder = HybridEncoder(init_channels=init_chan,cnn_layers=cnn_layers)
+
 
 		# PROJECTOR
-		proj_dim = 2048
-		self.projector1 = Projector(block_chan*16,proj_dim)
-		self.projector2 = Projector(block_chan*16,proj_dim)
-
-		# LOSS
-		lambd = 5e-3
-		self.loss = BarlowTwinsLoss(proj_dim,lambd)
+		self.embed_dim = init_chan*16
+		self.projector = Projector(self.embed_dim,proj_dim)
 
 
-	def forward(self,x,x_aug):
+	def forward(self,x,x_aug=None):
+		'''
+		x_aug=None: returns the embeddings of x, [B,N,D] (N = 16x16 grid for 256x256 input).
+		Otherwise:  returns (embeddings of x [B,N,D], projections z1,z2 [B*N,proj_dim]).
+		'''
+		normal = self.encoder(self.in_layer(x))
+		if x_aug is None:
+			return normal
 
-		normal    = self.E1(x)
-		augmented = self.E2(x_aug)
+		augmented = self.encoder(self.in_layer(x_aug))
 
-		B,N,D = normal.shape
-		normal = normal.reshape(B*N,D)
-		augmented = augmented.reshape(B*N,D)
+		# Each spatial token is a sample for the cross-correlation
+		# B,N,D = normal.shape
+		B,C,H,W = normal.shape
+		z1 = self.projector(normal.mean(dim=(2,3)))
+		z2 = self.projector(augmented.mean(dim=(2,3)))
 
-		normal    = self.projector1(normal)
-		augmented = self.projector2(augmented)
-
-		return normal,augmented
+		return normal,z1,z2
 
 
 ############################################################
@@ -288,11 +334,12 @@ class MaskDownsampler(nn.Module):
 	
 	'''
 	def __init__(self):
+		super().__init__()
 		# [B,1,256,256] -> [B,1,16,16]
-		self.downsampler = nn.AvgPool2d(kernel_size=31,stride=16,padding=15)
+		self.downsampler = nn.AvgPool2d(16)
 
-	def forward(self,x)
-		return self.downsample(x) #i.e. targets
+	def forward(self,x):
+		return self.downsampler(x) #i.e. targets
 
 
 class HealthVariablePredictorHead(nn.Module):
@@ -301,9 +348,7 @@ class HealthVariablePredictorHead(nn.Module):
 		super().__init__()
 		# A 1x1 convolution/linear regression head over each 16x16 cell
 		self.predict_head = nn.Sequential(
-			nn.Conv2d(embedding_dim, 128, kernel_size=1),
-			nn.ReLU(),
-			nn.Conv2d(128, 1, kernel_size=1)
+			nn.Conv2d(embedding_dim, 1, kernel_size=1)
 		)
 
 	def forward(self,x):
@@ -347,10 +392,36 @@ class MaskedSpatialDownsampler:
 			torch.zeros_like(sum_health)
 		)
 
-	return targets_downsampled
+		return targets_downsampled
 
 
 
 if __name__ == '__main__':
-	pass
-	#do some checks/print
+	B,C,S = 2,12,256
+	x     = torch.randn(B,C,S,S)
+	x_aug = torch.randn(B,C,S,S)
+
+	for enc in ['hybrid','conv','attn']:
+		net       = SentinelBarlowTwins(model_id=0,init_chan=C)
+		criterion = BarlowTwinsLoss(proj_dim=2048)
+		n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+
+		flop_counter = FlopCounterMode(display=False)
+		with flop_counter, torch.no_grad():
+			net(x,x_aug)
+		gflops = flop_counter.get_total_flops() / B / 1e9
+
+		emb,z1,z2 = net(x,x_aug)
+		loss,on_diag,off_diag = criterion(z1,z2)
+		loss.backward()
+		print(f'[{enc:>6}] params: {n_params/1e6:.2f}M | fwd GFLOPs/img (2 views): {gflops:.1f} | '
+		      f'embed: {tuple(emb.shape)} | loss: {loss.item():.2f} ({on_diag.item():.2f} + {off_diag.item():.2f})')
+
+	# PREDICTION PARTS
+	mask    = torch.rand(B,1,S,S) * (torch.rand(B,1,S,S) > 0.5)
+	targets = MaskedSpatialDownsampler()(mask)
+	print(f'mask: {tuple(mask.shape)} -> {tuple(MaskDownsampler()(mask).shape)} (avg) / {tuple(targets.shape)} (masked)')
+
+	emb  = emb.detach().transpose(1,2).reshape(B,-1,16,16) # [B,N,D] -> [B,D,16,16]
+	pred = HealthVariablePredictorHead(embedding_dim=emb.shape[1])(emb)
+	print(f'prediction head: {tuple(emb.shape)} -> {tuple(pred.shape)}')
