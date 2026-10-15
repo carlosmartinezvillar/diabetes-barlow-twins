@@ -164,7 +164,7 @@ class HybridEncoder(nn.Module):
 		return x.reshape(B,H,W,C).permute(0,3,1,2)
 
 
-class PureConvEncoder(nn.Module):
+class ConvEncoder(nn.Module):
 	'''
 	Same conv backbone as HybridEncoder, without the attention layers.
 	'''
@@ -186,6 +186,9 @@ class PureConvEncoder(nn.Module):
 		self.down4 = nn.Conv2d(init_channels*8,init_channels*16,**down_params)
 
 		self.conv5 = ConvBlock(channels=init_channels*16,depth=cnn_depth)
+		self.down5 = nn.Conv2d(init_channels*16,init_channels*32,**down_params)
+
+		self.conv6 = ConvBlock(channels=init_channels*32,depth=cnn_depth)
 
 
 	def forward(self,x):
@@ -194,12 +197,14 @@ class PureConvEncoder(nn.Module):
 		x = self.down2(self.conv2(x))
 		x = self.down3(self.conv3(x))
 		x = self.down4(self.conv4(x))
-		x = self.conv5(x)
+		x = self.down5(self.conv5(x))		
+		x = self.conv6(x)
 
-		# [B,C,H,W] -> [B,H*W,C]
+		# Return [B,N,D] as [B,C,H,W] -> [B,H*W,C]
 		# B,C,H,W = x.shape
 		# return x.permute(0,2,3,1).reshape(B,H*W,C)
 
+		# RETURN [B,32C,H/32,W/32]
 		return x
 
 
@@ -241,9 +246,9 @@ class PureAttnEncoder(nn.Module):
 ############################################################
 class Projector(nn.Module):
 	'''
-	Barlow Twins projector.
+	Barlow Twins projector. Takes [B,D] inputs.
 	'''
-	def __init__(self,in_dim,out_dim=2048):
+	def __init__(self,in_dim,out_dim=4096):
 		super().__init__()
 		self.layers = nn.Sequential(
 			nn.Linear(in_dim, out_dim),
@@ -267,15 +272,22 @@ class BarlowTwinsLoss(nn.Module):
 		self.bn    = nn.BatchNorm1d(proj_dim,affine=False,track_running_stats=False)
 
 	def forward(self,z1,z2):
+
+		# DO IN FLOAT 32
 		with torch.autocast(device_type='cuda' if z1.is_cuda else 'cpu',enabled=False):
+
+			# NORMALIZE ON BATCH MEAN AND STD DEV.
 			z1 = self.bn(z1.float())
 			z2 = self.bn(z2.float())
+
+			# CALCULATE CORRELATION MATRIX
 			c  = z1.T @ z2 / z1.shape[0] # [D,D]
 
 			diag     = torch.diagonal(c)
 			on_diag  = (diag - 1).pow(2).sum()
 			off_diag = c.pow(2).sum() - diag.pow(2).sum()
 			loss     = on_diag + self.lambd * off_diag
+
 		return loss, on_diag.detach(), off_diag.detach()
 
 
@@ -284,7 +296,7 @@ class SentinelBarlowTwins(nn.Module):
 	'''
 	Main class/entry point.
 	'''
-	def __init__(self,model_id,bands=10,init_chan=64,cnn_layers=2,proj_dim=1024):
+	def __init__(self,model_id,bands=10,init_chan=64,cnn_layers=2,proj_dim=2048):
 		super().__init__()
 
 		# META
@@ -295,32 +307,32 @@ class SentinelBarlowTwins(nn.Module):
 		self.in_layer = nn.Conv2d(bands,init_chan,3,1,1,bias=True)
 
 		# ENCODER (shared by both views, as in Barlow Twins)
-		self.encoder = HybridEncoder(init_channels=init_chan,cnn_layers=cnn_layers)
-
+		# self.encoder = HybridEncoder(init_channels=init_chan,cnn_layers=cnn_layers)
+		self.encoder = ConvEncoder(init_channels=init_chan,cnn_depth=cnn_layers)
 
 		# PROJECTOR
-		self.embed_dim = init_chan*16
-		self.projector = Projector(self.embed_dim,proj_dim)
+		self.representation_dim = init_chan*32
+		self.projector = Projector(self.representation_dim,proj_dim)
 
 
 	def forward(self,x,x_aug=None):
 		'''
-		x_aug=None: returns the embeddings of x, [B,N,D] (N = 16x16 grid for 256x256 input).
-		Otherwise:  returns (embeddings of x [B,N,D], projections z1,z2 [B*N,proj_dim]).
+		x_aug=None: returns the embeddings of x, [B,C,H,W] (HxW = N = 16x16 for 256x256 input).
+		Otherwise:  returns (embeddings of x [B,C,H,W], projections z1,z2 [B*N,proj_dim]).
 		'''
-		normal = self.encoder(self.in_layer(x))
+		rep = self.encoder(self.in_layer(x))
+
 		if x_aug is None:
-			return normal
+			return rep.mean(dim=(2,3))
 
-		augmented = self.encoder(self.in_layer(x_aug))
+		rep_aug = self.encoder(self.in_layer(x_aug))
 
-		# Each spatial token is a sample for the cross-correlation
-		# B,N,D = normal.shape
-		B,C,H,W = normal.shape
-		z1 = self.projector(normal.mean(dim=(2,3)))
-		z2 = self.projector(augmented.mean(dim=(2,3)))
+		# Whole-image embeddings
+		# B,C,H,W = normal.shape
+		emb1 = self.projector(rep.mean(dim=(2,3))) # GAP: [B,C,H,W] -> [B,C]
+		emb2 = self.projector(rep_aug.mean(dim=(2,3))) # GAP: [B,C,H,W] -> [B,C]
 
-		return normal,z1,z2
+		return rep,emb1,emb2
 
 
 ############################################################
