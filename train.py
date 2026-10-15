@@ -28,13 +28,41 @@ class Logger():
 		self.header = None
 
 	def log(self,metrics):
-		# row = [f'{v:.6f}' if isinstance(v,float) else str(v) for v in metrics.values()]
+
+		if self.header is None:
+			self.header = list(metrics.keys())
+			with open(self.path,'w') as fp:
+				fp.write('\t'.join(self.header)+'\n')
+
+		row = [f'{v:.5f}' if isinstance(v,float) else str(v) for v in metrics.values()]
 		with open(self.path,'a') as fp:
 			fp.write('\t'.join(row) + '\n')
 
 
 def save_checkpoint(path,model,optim,epoch,metrics,tag):
-	pass
+	save_path = f"{path}/{tag}_{model.model_id:03}.pth.tar"
+
+	raw_model = model._orig_mod if hasattr(model,'_orig_mod') else model
+
+	chkpt = {
+		'epoch': epoch,
+		'tloss': metrics['tloss'],
+		'v_err': metrics['rmse'],
+		'model_state_dict': raw_model.state_dict(),
+		'optim_state_dict': optim.state_dict()
+	}
+
+	torch.save(chkpt,save_path)
+	return save_path
+
+
+class RecentBestTracker(n=3):
+
+	def __init__(self):
+		pass
+
+	def update(self,path):
+		pass	
 
 
 def set_seed(seed):
@@ -79,7 +107,7 @@ def score_probe(X_tr,X_va,Y_tr,Y_va):
 		"r2": float(1 - np.mean(err ** 2) / np.var(y_va)),  # 0 = no better than predicting the mean
 		"spearman": float(spearmanr(y_va, y_hat)[0]),       # are tracts ranked correctly?
 		"alpha": float(alpha),
-		"alpha_at_edge": bool(np.isclose(alpha, alphas[0]) or np.isclose(alpha, alphas[-1])),  # True -> widen alphas
+		"alpha_edge": bool(np.isclose(alpha, alphas[0]) or np.isclose(alpha, alphas[-1])),  # True -> widen alphas
 	}
 	return scores, y_hat, probe
 
@@ -202,7 +230,7 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 	# LOGGING
 	logger = Logger(f'{LOG_DIR}/epochs_{model.model_id:03}.tsv')
 	best_epoch = 0
-	# best_vloss = float('inf')
+	best_vloss = 0.0
 
 
 	# HEALTH VALUE PER TRACT ID (Y = tract_values[ids] AFTER build_table)
@@ -217,8 +245,8 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 		# TRAIN
 		tr_result = train(model,loss_fn,dataloaders,optimizer,scheduler,device)
 
-		# AT EPOCH K -- VALIDATE: BUILD TRACT-EMBEDDING TABLES, FIT PROBE, EVALUATE
-		if epoch+1 > 10 and (epoch+1) % 10 == 0:
+		# AT EPOCH K -- VALIDATE: BUILD PER-TRACT EMBEDDINGS, FIT PROBE, PREDICT DIABETES
+		if epoch+1 >= 10 and (epoch+1) % 10 == 0:
 
 			# BUILD TRAIN TABLE
 			model.eval()
@@ -235,11 +263,22 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 			# FIT REGRESSION
 			scores = score_probe(avg_emb_t,avg_emb_v,Y_tr,Y_va)
 
+		else:
+			scores = {
+				"rmse":'NaN',
+				"mae": 'NaN',
+				"r2": 'NaN',
+				"spearman": 'NaN',
+				"alpha": 'NaN',
+				"alpha_edge": 'NaN'
+			}
+
 		epoch_t1 = time.perf_counter()
 		print(f"Epoch time: {epoch_t1-epoch_t0:.2f} secs.")
 
+		epoch_results = scores.update(tr_result)
+
 		# LOG EPOCH
-		# epoch_results = calculate_metrics(tr_result,va_result,optimizer)
 		logger.log(epoch_results)
 
 		# SAVE CHECKPOINT
@@ -264,13 +303,25 @@ def load_hyperparameters(args):
 
 
 def parse_args():
+	# SET + LOAD
 	parser = argparse.ArgumentParser(description='Barlow Twins pre-training on Sentinel-2 chips.')
 	parser.add_argument('--id',type=int,default=0,help='Model key id')
 	parser.add_argument('--data-dir',type=str,default=None,help='Dir for chips.')
-	parser.add_argument('--log-dir',type=str,default=None)
-	parser.add_argument('--checkpoint-dir',type=str,default=None)
+	parser.add_argument('--log-dir',type=str,default=None,help='Dir for logs outputted by train.py')
+	parser.add_argument('--checkpoint-dir',type=str,default=None,help='Dir for ouputted checkpoint weights.')
 	parser.add_argument('--device',type=str,default='0')
-	return parser.parse_args()
+	parser.add_argument('-p','--params',required=True,default='./hparams/hpo_1.json')
+	args = parser.parse_args()
+
+	assert os.path.isdir(args.data_dir), f"Data dir not found at {args.data_dir}"
+	assert os.path.isdir(args.log_dir), f"Log dir not found at {args.log_dir}"
+	assert os.path.isdir(args.checkpoint_dir), f"Checkpoint dir not found at {args.checkpoint_dir}"
+	assert os.path.isfile(args.params), f"Hyperparameter dict path not found at {args.params}"
+
+	assert args.gpu >= 0, "Incorrect index in GPU id"
+	assert args.gpu < torch.cuda.device_count(), "Out of range GPU id"
+
+	return args
 
 
 if __name__ == '__main__':
@@ -318,6 +369,10 @@ if __name__ == '__main__':
 		shuffle=True,
 		drop_last=True,
 		**loader_params
+	)
+
+	t_load_labeled = torch.utils.DataLoader(
+		dataset=dataloader.SentinelPairedDataset(args.data_dir,)
 	)
 
 	v_dload = torch.utils.data.DataLoader(
