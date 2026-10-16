@@ -39,6 +39,22 @@ class Logger():
 			fp.write('\t'.join(row) + '\n')
 
 
+class RecentBestTracker():
+	'''
+	Keep only 'n' .pth.tar files.
+	'''
+	def __init__(self,n=3):
+		self.n = n
+		self.paths = [] #FIFO for top n models.
+
+	def update(self,path):
+		self.paths.append(path)
+		if len(self.paths) > self.n:
+			old_path = self.paths.pop(0)
+			if os.path.exists(old_path):
+				os.remove(old_path)
+
+
 def save_checkpoint(path,model,optim,epoch,metrics,tag):
 	save_path = f"{path}/{tag}_{model.model_id:03}.pth.tar"
 
@@ -54,15 +70,6 @@ def save_checkpoint(path,model,optim,epoch,metrics,tag):
 
 	torch.save(chkpt,save_path)
 	return save_path
-
-
-class RecentBestTracker(n=3):
-
-	def __init__(self):
-		pass
-
-	def update(self,path):
-		pass	
 
 
 def set_seed(seed):
@@ -90,13 +97,13 @@ def score_probe(X_tr,X_va,Y_tr,Y_va):
 	Calculate the regression on health variable from the avg tract embedding table.
 	'''
 	# DEFAULT
-	alphas = np.logspace(0, 6, 8)
+	alphas = np.logspace(start=0,stop=6,num=8)
 	folds = list(KFold(n_splits=3, shuffle=True, random_state=0).split(X_tr))
 
-	# FIT RIDGE TO TRAIN SET
+	# FIT RIDGE REGRESSION TO TRAIN SET EMBEDDINGS
 	probe = make_pipeline(StandardScaler(),RidgeCV(alphas=alphas,cv=folds)).fit(X_tr, Y_tr)
 
-	# PREDICT VAL VALUES
+	# PREDICT VALIDATION HEALTH VALUES FROM VALIDATION EMBEDDINGS
 	y_hat = probe.predict(X_va)
 	error = y_hat - Y_va
 	alpha = probe[-1].alpha_
@@ -117,11 +124,15 @@ def load_tract_values(split_tracts_csv,values_csv):
 	Array indexed by tract id (tract_index) holding the health value, joined on GEOID.
 	NaN for ids without a value.
 	'''
+
+	# LOAD {GEOID:diabetes value}
 	with open(values_csv) as fp:
 		by_geoid = {r['LocationID']: float(r['Data_Value']) for r in csv.DictReader(fp)}
 
+	# LOAD GEOID + INDEX IN ORIGINAL (VALUES CSV)
 	with open(split_tracts_csv) as fp:
 		tracts = list(csv.DictReader(fp))
+
 
 	values = np.full(max(int(r['tract_index']) for r in tracts)+1,np.nan,dtype=np.float32)
 
@@ -229,21 +240,25 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 
 	# LOGGING
 	logger = Logger(f'{LOG_DIR}/epochs_{model.model_id:03}.tsv')
+	chkpt_tracker = RecentBestTracker(n=3)
 	best_epoch = 0
 	best_vloss = 0.0
-
 
 	# HEALTH VALUE PER TRACT ID (Y = tract_values[ids] AFTER build_table)
 	tract_values = load_tract_values('./split_tracts.csv','./filtered_diabetes.csv')
 
+	# TRAIN AND VALIDATE -- RUN
 	overall_t0 = time.perf_counter()
 	for epoch in range(epochs):
 
 		print(f'--- EPOCH {e:03} ---')
-		epoch_t0 = time.perf_counter()
+		epoch_time_t0 = time.perf_counter()
 
 		# TRAIN
+		train_time_t0 = time.perf_counter()
 		tr_result = train(model,loss_fn,dataloaders,optimizer,scheduler,device)
+		train_time_t1 = time.perf_counter()
+		print(f"Train time: {train_time_t1-train_time_t0:2.f} secs.")
 
 		# AT EPOCH K -- VALIDATE: BUILD PER-TRACT EMBEDDINGS, FIT PROBE, PREDICT DIABETES
 		if epoch+1 >= 10 and (epoch+1) % 10 == 0:
@@ -273,25 +288,25 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 				"alpha_edge": 'NaN'
 			}
 
-		epoch_t1 = time.perf_counter()
-		print(f"Epoch time: {epoch_t1-epoch_t0:.2f} secs.")
-
-		epoch_results = scores.update(tr_result)
-
 		# LOG EPOCH
+		epoch_results = scores.update(tr_result)
 		logger.log(epoch_results)
 
 		# SAVE CHECKPOINT
-		# save_checkpoint(tag,model,optimizer,epoch)
-		if va_result['vloss'] < best_vloss:
-			best_vloss = va_result['vloss']
-			best_epoch = epoch
-			save_checkpoint(MODEL_DIR, model,optimizer,epoch)
+		if epoch+1 >= 10 and (epoch+1) % 10 == 0:
 
+			# save
+			if scores['rmse'] < best_vloss:
+				tag = 'rmse'
+				best_vloss = scores['rmse']
+				best_epoch = epoch
+				save_checkpoint(MODEL_DIR,model,optimizer,epoch,scores,tag)
 
-	overall_t1 = time.perf_counter()
+		epoch_time_t1 = time.perf_counter()
+		print(f"Epoch time: {epoch_t1-epoch_t0:.2f} secs.")
 
 	# STDOUT TIME/OVERALL BEST/VRAM
+	overall_t1 = time.perf_counter()
 	print(f'Total time: {(overall_t1-overall_t0)/60:.1f} min')
 	print(f'Best epoch: {best_epoch} | vloss: {best_vloss:.5f}')
 	mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
@@ -299,7 +314,23 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 
 
 def load_hyperparameters(args):
+
+	# LOAD FILE
+	with open(args.params,'r') as fp:
+		hp_list = [json.loads(line) for line in fp.readlines() if line != "\n"]
+	assert len(hp_list) > 0, f"Got empty file for {args.params}"
+
+	# SET IDs AS KEYS and CHECK
+	hp_list_indexed = {row['id']:row for row in hp_list}
+	assert args.id in hp_list_indexed, f"model id '{args.id}' not in hyperparameter file {args.params}"
+
+	# SET DICT FOR CURRENT MODEL
+	HP = hp_list_indexed[args.id]
+
+	# CHECK HERE -- TODO TRY-EXCEPT TO SPECIFIC ERR
 	pass
+
+	return HP
 
 
 def parse_args():
@@ -320,6 +351,11 @@ def parse_args():
 
 	assert args.gpu >= 0, "Incorrect index in GPU id"
 	assert args.gpu < torch.cuda.device_count(), "Out of range GPU id"
+
+	global MODEL_DIR
+	global LOG_DIR
+	MODEL_DIR = args.checkpoint_dir
+	LOG_DIR   = args.log_dir
 
 	return args
 
