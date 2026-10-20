@@ -12,7 +12,7 @@ import tifffile as tiff
 import random
 import csv
 
-# DATASET MEAN AND STD DEV.
+# TRAINING SUBSET MEAN AND STD DEV.
 MEAN = torch.tensor([83.8274,78.5392,83.9449,77.0361,97.3247,
 	146.737,141.844,147.537,126.045,97.1117]).view(-1,1,1)
 
@@ -500,4 +500,19 @@ class RAMLabeledDataset(torch.utils.data.Dataset):
 ################################################################################
 # OTHER
 ################################################################################
-pass
+parser = argparse.ArgumentParser(description='Barlow Twins Dataloaders for Sentinel-2 chips.')
+parser.add_argument('--data-dir',type=str,required=True,help='Dir for chips.')
+parser.add_argument('--mask-dir',type=str,required=True,help='Dir for feature/tract masks (*_ftr.tif).')
+parser.add_argument('--cache-dir',type=str,required=True,help='Output dir')
+parser.add_argument('--split',type=str,required=True,help='train/val/test')
+
+args = parser.parse_args()
+
+assert os.path.isdir(args.data_dir), f"Data dir not found at {args.data_dir}"
+assert os.path.isdir(args.mask_dir), f"Data dir not found at {args.mask_dir}"
+assert os.path.isdir(args.cache_dir), f"Data dir not found at {args.cache_dir}"
+args.data_dir = args.data_dir.rstrip('/')
+args.mask_dir = args.mask_dir.rstrip('/')
+args.cache_dir = args.cache_dir.rstrip('/')
+
+build_cached_dataset(args.data_dir,args.mask_dir,'./split_chips.csv',args.split,args.cache_dir)

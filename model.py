@@ -315,24 +315,24 @@ class SentinelBarlowTwins(nn.Module):
 		self.projector = Projector(self.representation_dim,proj_dim)
 
 
-	def forward(self,x,x_aug=None):
+	def forward(self,x1,x2=None):
 		'''
 		x_aug=None: returns the embeddings of x, [B,C,H,W] (HxW = N = 16x16 for 256x256 input).
 		Otherwise:  returns (embeddings of x [B,C,H,W], projections z1,z2 [B*N,proj_dim]).
 		'''
-		rep = self.encoder(self.in_layer(x))
+		rep1 = self.encoder(self.in_layer(x1))
 
-		if x_aug is None:
-			return rep.mean(dim=(2,3))
+		if x2 is None:
+			return rep1.mean(dim=(2,3))
 
-		rep_aug = self.encoder(self.in_layer(x_aug))
+		rep2 = self.encoder(self.in_layer(x2))
 
 		# Whole-image embeddings
 		# B,C,H,W = normal.shape
-		emb1 = self.projector(rep.mean(dim=(2,3))) # GAP: [B,C,H,W] -> [B,C]
-		emb2 = self.projector(rep_aug.mean(dim=(2,3))) # GAP: [B,C,H,W] -> [B,C]
+		emb1 = self.projector(rep1.mean(dim=(2,3))) # GAP: [B,C,H,W] -> [B,C]
+		emb2 = self.projector(rep2.mean(dim=(2,3))) # GAP: [B,C,H,W] -> [B,C]
 
-		return rep,emb1,emb2
+		return rep1,emb1,emb2
 
 
 ############################################################
