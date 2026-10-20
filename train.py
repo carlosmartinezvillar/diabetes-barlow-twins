@@ -417,7 +417,7 @@ if __name__ == '__main__':
 	)
 
 	v_dload = torch.utils.data.DataLoader(
-		dataset=dataloader.MappedLabeledDataset(args.data_dir,,split='val'),
+		dataset=dataloader.MappedLabeledDataset(args.data_dir,split='val'),
 		shuffle=False,
 		drop_last=False,
 		**loader_params
