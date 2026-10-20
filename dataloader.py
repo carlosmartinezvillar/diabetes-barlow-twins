@@ -11,6 +11,7 @@ import os
 import tifffile as tiff
 import random
 import csv
+import argparse
 
 # TRAINING SUBSET MEAN AND STD DEV.
 MEAN = torch.tensor([83.8274,78.5392,83.9449,77.0361,97.3247,
