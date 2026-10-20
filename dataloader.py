@@ -100,7 +100,7 @@ class PatchViewTransform:
 		])
 
 		self.post_norm = v2.Compose([
-			BandOffset(factor=0.05),
+			# BandOffset(factor=0.05),
 			GaussianNoise(sigma=0.03,p=0.5)
 		])
 
@@ -114,15 +114,22 @@ class PatchViewTransform:
 class RotatedPatchViewTransform:
 	'''
 	Passes both img and index label to reconstruct rotation of elements in N.
+	Returns (x, patch_ids): patch_ids[i,j] is the original patch index (0..G*G-1)
+	that feature-map cell (i,j) of the encoder output came from.
 	'''
-	def __init__(self,crop_size=192,blur=0.1):
+	def __init__(self,blur=0.1,img_size=256,patch_size=32):
+		assert img_size % patch_size == 0, "img_size must be a multiple of patch_size"
 
-		self.G = 8
-		self.P = 32
-		self.idx = None #matrix of indices
+		self.P = patch_size           # = encoder stride (5 stride-2 convs -> 32)
+		self.G = img_size//patch_size # patches per side on the full chip
 
+		# PIXEL-LEVEL MAP OF PATCH INDICES [H,W]: every pixel holds the id of its PxP patch
+		idx = torch.arange(self.G*self.G).view(self.G,self.G)
+		idx = idx.repeat_interleave(self.P,0).repeat_interleave(self.P,1)
+		self.idx = tv_tensors.Mask(idx)
+
+		# NO CROP: full chip, so every patch appears in both views
 		self.geometric = v2.Compose([
-			v2.RandomCrop(size=crop_size),			
 			v2.RandomHorizontalFlip(p=0.5),
 			v2.RandomVerticalFlip(p=0.5),
 			v2.RandomChoice([
@@ -139,23 +146,36 @@ class RotatedPatchViewTransform:
 		])
 
 		self.post_norm = v2.Compose([
-			BandOffset(factor=0.05),
+			# BandOffset(factor=0.05),
 			GaussianNoise(sigma=0.03,p=0.5)
 		])
 
 	def __call__(self,x):
-		x,indices = self.geometric(x,self.idx)
+
+		# # PATCH-ALIGNED RANDOM CROP, SAME WINDOW ON IMAGE AND INDEX MASK
+		# n    = self.crop_size//self.P
+		# top  = random.randint(0,self.G-n)*self.P
+		# left = random.randint(0,self.G-n)*self.P
+		# x    = v2.functional.crop(x,top,left,self.crop_size,self.crop_size)
+		# mask = v2.functional.crop(self.idx,top,left,self.crop_size,self.crop_size)
+
+		# SAME FLIPS/ROTATION APPLIED TO IMAGE AND INDEX MASK (Mask uses nearest -> ids stay exact)
+		x,mask = self.geometric(x,self.idx)
+
+		# ONE ID PER PxP CELL (sample cell centers): [H,W] -> [G,G]
+		patch_ids = mask[self.P//2::self.P,self.P//2::self.P].as_subclass(torch.Tensor)
+
 		x = self.spectral(x/255)
 		x = (x*255 - MEAN) / STDD
 		x = self.post_norm(x)
-		return x
+		return x,patch_ids
 
 
 class ImageViewTransform:
 	'''
 	Image-level embeddings.
 	'''
-	def __init__(self,crop_size=192,blur=0.1):
+	def __init__(self,crop_size=224,blur=0.1):
 		self.geometric = v2.Compose([
 			v2.RandomCrop(size=crop_size),			
 			v2.RandomHorizontalFlip(p=0.5),
@@ -174,106 +194,58 @@ class ImageViewTransform:
 		])
 
 		self.post_norm = v2.Compose([
-			BandOffset(factor=0.05),
+			# BandOffset(factor=0.05),
 			GaussianNoise(sigma=0.03,p=0.5)
 		])
 
 	def __call__(self,x):
 		x = self.geometric(x)
-		x = self.spectral(x/255)
-		x = (x*255 - MEAN)/STDD
-		x = self.post_norm(x)
+		x = self.spectral(x/255) #applied to range 0-1
+		x = (x*255 - MEAN)/STDD #[0-255] to ~[-3,3]
+		x = self.post_norm(x) #applied to normalized values 
 		return x
 
 
-class ImageTransform:
+class PatchTransform:
 	def __init__(self):
-		self.view_1 = ImageViewTransform(crop_size=192,blur=0.1)
-		self.view_2 = ImageViewTransform(crop_size=192,blur=0.1)
+		self.view_1 = PatchViewTransform(blur=0.1)
+		self.view_2 = PatchViewTransform(blur=0.1)
 
 	def __call__(self,x):
 		return self.view_1(x),self.view_2(x)
 
-################################################################################
-# DATASET CLASSES
-################################################################################
-class SentinelPairedDataset(torch.utils.data.Dataset):
-	'''
-	Self-supervised pre-training dataloder.
-	'''
-	def __init__(self,chip_dir,transform,split='train'):
-		split_csv = "./split_chips.csv"
-		chips,_  = read_split(split_csv,split)
-		self.ids = [f"{chip_dir}/{c}" for c in chips]
-		self.transform = transform
 
-	def get_bands(self,idx):
-		img = torch.from_numpy(tiff.imread(f"{self.ids[idx]}_rgb.tif")).to(torch.float32)
-		return tv_tensors.Image(img)
+class RotatedPatchTransform:
+	def __init__(self):
+		self.view_1 = RotatedPatchViewTransform(blur=0.1)
+		self.view_2 = RotatedPatchViewTransform(blur=0.1)
 
-	def __len__(self):
-		return len(self.ids)
-
-	def __getitem__(self,idx):
-		return self.transform(self.get_bands(idx))
+	def __call__(self,x):
+		return self.view_1(x),self.view_2(x)
 
 
-class SentinelLabeledDataset(torch.utils.data.Dataset):
-	'''
-	Evaluation. Loads, image,label, mask.
-	Mask is 4-dim array with RUCA,population,area,tract_ids.
-	'''
-	def __init__(self,chip_dir,feat_dir,split='val'):
-		# DIR PATHS
-		chips,self.n_tracts = read_split('./split_chips.csv',split)
-		self.band_ids = [f"{chip_dir}/{c}" for c in chips]
-		self.feat_ids = [f"{feat_dir}/{c}" for c in chips]
+class ImageTransform:
+	def __init__(self):
+		self.view_1 = ImageViewTransform(crop_size=224,blur=0.1)
+		self.view_2 = ImageViewTransform(crop_size=224,blur=0.1)
 
-	def get_bands(self,idx):
-		# return Image.open(f'{self.ids[idx]}_rgb.tif')
-		img = torch.from_numpy(tiff.imread(f"{self.band_ids[idx]}_rgb.tif")).to(torch.float32)
-		img = tv_tensors.Image(img)
-		return img
-
-	def get_label(self,idx):
-		# 00.0% stored as 0-999, return as [0-1]
-		lbl = torch.from_numpy(tiff.imread(f"{self.band_ids[idx]}_lbl.tif"))
-		lbl = torch.squeeze(lbl,0).to(torch.float32).div(1000) 
-		return lbl
-
-	def get_tract(self,idx):
-		ext = torch.from_numpy(tiff.imread(f"{self.feat_ids[idx]}_ftr.tif")[...,3])
-		ext = torch.squeeze(ext,0).to(torch.uint16)
-		return ext
-
-	def __len__(self):
-		return len(self.band_ids)
-
-	def __getitem__(self,idx):
-
-		# LOAD TO TENSORS
-		bands = self.get_bands(idx)
-		label = self.get_label(idx)
-		extra = self.get_tract(idx)
-
-		# NORMALIZE BANDS
-		bands = (bands - MEAN) / STDD
-
-		# DONE
-		return bands,label,extra
+	def __call__(self,x):
+		return self.view_1(x),self.view_2(x)
 
 
-class FastImageViewTransform(torch.nn.Module):
+class GPUImageViewTransform(torch.nn.Module):
 
 	'''
+	On GPU transform.
 	Use:
 
-	aug = dataloader.FastViewTransform().to(device)
+	aug = dataloader.FastImageViewTransform().to(device)
 	for x in dataloader:
 		x = x.to(device)
 		X1,X2 = aug(x),aug(x)
 	'''
 	def __init__(self):
+		super().__init__()
 		self.crop = 192
 		self.blur = 0.1
 		self.ksize = 9
@@ -344,12 +316,82 @@ class FastImageViewTransform(torch.nn.Module):
 		# GAUSSIAN NOISE
 		x = x + self.noise * torch.randn_like(x)*(torch.rand(B,1,1,1,device=dev) < self.noise_p)
 
-		return x
+		return x	
 
-
-class FastSentinelPairedDataset(torch.utils.data.Dataset):
+################################################################################
+# DATASET CLASSES
+################################################################################
+class PairedDataset(torch.utils.data.Dataset):
 	'''
-	Memory mapped to .npy for fast loading.
+	Self-supervised pre-training dataloder.
+	'''
+	def __init__(self,chip_dir,transform,split='train'):
+		split_csv = "./split_chips.csv"
+		chips,_  = read_split(split_csv,split)
+		self.ids = [f"{chip_dir}/{c}" for c in chips]
+		self.transform = transform
+
+	def get_bands(self,idx):
+		img = torch.from_numpy(tiff.imread(f"{self.ids[idx]}_rgb.tif")).to(torch.float32)
+		return tv_tensors.Image(img)
+
+	def __len__(self):
+		return len(self.ids)
+
+	def __getitem__(self,idx):
+		return self.transform(self.get_bands(idx))
+
+
+class LabeledDataset(torch.utils.data.Dataset):
+	'''
+	Evaluation. Loads, image,label, mask.
+	Image: [10,256,256] uint8
+	Label: [256,256] uint16 with range 1-999
+	Mask: [4,256,256] uint16 with bands [RUCA,population,area,tract_ids]
+	'''
+	def __init__(self,chip_dir,feat_dir,split='val'):
+		# DIR PATHS
+		chips,self.n_tracts = read_split('./split_chips.csv',split)
+		self.band_ids = [f"{chip_dir}/{c}" for c in chips]
+		self.feat_ids = [f"{feat_dir}/{c}" for c in chips]
+
+	def get_bands(self,idx):
+		# return Image.open(f'{self.ids[idx]}_rgb.tif')
+		img = torch.from_numpy(tiff.imread(f"{self.band_ids[idx]}_rgb.tif")).to(torch.float32)
+		img = tv_tensors.Image(img)
+		return img
+
+	def get_label(self,idx):
+		# single decimal percentage (00.0%) stored as 0-999, return as [0-1]
+		lbl = torch.from_numpy(tiff.imread(f"{self.band_ids[idx]}_lbl.tif"))
+		lbl = torch.squeeze(lbl,0).to(torch.float32).div(1000) 
+		return lbl
+
+	def get_tract(self,idx):
+		ext = torch.from_numpy(tiff.imread(f"{self.feat_ids[idx]}_ftr.tif")[...,3])
+		ext = torch.squeeze(ext,0).to(torch.uint16)
+		return ext
+
+	def __len__(self):
+		return len(self.band_ids)
+
+	def __getitem__(self,idx):
+
+		# LOAD TO TENSORS
+		bands = self.get_bands(idx)
+		label = self.get_label(idx)
+		extra = self.get_tract(idx)
+
+		# NORMALIZE BANDS
+		bands = (bands - MEAN) / STDD
+
+		# DONE
+		return bands,label,extra
+
+
+class MappedPairedDataset(torch.utils.data.Dataset):
+	'''
+	Memory mapped to .npy for fast loading. Loads from disk.
 	'''
 	def __init__(self,cache_dir,transform,split='train'):
 		self.path = f"{cache_dir}/{split}_rgb.npy"
@@ -367,11 +409,14 @@ class FastSentinelPairedDataset(torch.utils.data.Dataset):
 		return self.transform(tv_tensors.Image(img))
 
 
-class FastSentinelLabeledDataset(torch.utils.data.Dataset):
+class MappedLabeledDataset(torch.utils.data.Dataset):
 	'''
-	Memory mapped to .npy for fast loading.
+	Memory mapped to .npy in disk for fast loading. Loads from disk.
+	Reduces cpu-gpu transfer size by loading and passing original files and 
+	doing augmentations only in GPU.
 	'''
 	def __init__(self,cache_dir,split='val'):
+		self.chips,self.n_tracts = read_split('./split_chips.csv',split)		
 		self.dir   = cache_dir
 		self.split = split
 		self.n     = np.load(f"{self.dir}/{self.split}_lbl.npy",mmap_mode='r').shape[0]
@@ -393,6 +438,64 @@ class FastSentinelLabeledDataset(torch.utils.data.Dataset):
 		tract = torch.from_numpy(np.array(self.trc[idx]))
 		return (bands-MEAN)/ STDD, label, tract
 
+
+class RAMPairedDataset(torch.utils.data.Dataset):
+	def __init__(self,cache_dir,transform,split='train'):
+		self.path = f"{cache_dir}/{split}_rgb.npy"
+		self.transform = transform
+
+		print("Loading cached dataset to RAM...")
+		self.rgb = torch.from_numpy(np.load(self.path))
+		self.n   = self.rgb.shape[0]
+		print("Loaded to RAM")
+
+
+	def __len__(self):
+		return self.n
+
+
+	def __getitem__(self,idx):
+		img = self.rgb[idx].to(torch.float32)
+		return self.transform(tv_tensors.Image(img))
+
+
+class RAMLabeledDataset(torch.utils.data.Dataset):
+
+	def __init__(self,cache_dir,split='val'):
+
+		self.chips,self.n_tracts = read_split('./split_chips.csv',split)
+
+		# LOAD DATASET
+		print("Loading cached dataset to RAM...")
+		self.rgb = torch.from_numpy(np.load(f"{cache_dir}/{split}_rgb.npy"))
+		self.lbl = torch.from_numpy(np.load(f"{cache_dir}/{split}_lbl.npy"))
+		self.trc = torch.from_numpy(np.load(f"{cache_dir}/{split}_trc.npy"))
+		print("Loaded to RAM")
+
+		# SIZE
+		self.n = self.rgb.shape[0]
+
+
+	def __len__(self):
+		return self.n
+
+
+	def __getitem__(self,idx):
+
+		# LOAD FROM ARRAY IN RAM
+		bands = self.rgb[idx]
+		label = self.lbl[idx]
+		tract = self.trc[idx]
+
+		# ADJUST
+		bands = tv_tensors.Image(bands.to(torch.float32))
+		label = torch.squeeze(label,0).to(torch.float32).div(1000)
+		tract = torch.squeeze(tract,0).to(torch.uint16)
+
+		# NORMALIZE BANDS
+		bands = (bands-MEAN)/STDD
+
+		return bands, label, tract
 
 ################################################################################
 # OTHER
