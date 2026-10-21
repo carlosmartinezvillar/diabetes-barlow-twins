@@ -421,8 +421,8 @@ if __name__ == '__main__':
 		'batch_size': hp['batch'],
 		'num_workers': args.num_workers,
 		'pin_memory': True,
-		'prefetch_factor': 4,
-		'persistent_workers': True
+		'prefetch_factor': 2,
+		'persistent_workers': False
 	}
 
 	train_transform = dataloader.ImageTransform()
