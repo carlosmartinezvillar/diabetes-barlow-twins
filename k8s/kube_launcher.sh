@@ -4,24 +4,74 @@
 #
 #   ./k8s/kube_launcher.sh ./hparams/hpo_1.json 0 29
 #
-# The template must contain these placeholders, which are substituted per job:
+# Rewrites three fields of the template per job, by structure -- no placeholder
+# tokens needed:
 #
-#   {{JOB_NAME}}   metadata.name          e.g. hpo-1-007
-#   {{MODEL_ID}}   env MODEL_ID value     e.g. 7      (matches 'id' in the params file)
-#   {{RUN_NAME}}   env RUN_NAME value     e.g. hpo_1  (train.sh reads ./hparams/$RUN_NAME.json)
+#   metadata.name        -> <run>-<id>  e.g. hpo-1-007   (RFC 1123: lowercase, no '_')
+#   env MODEL_ID value   -> the id      e.g. 7           (matches 'id' in the params file)
+#   env RUN_NAME value   -> the run     e.g. hpo_1       (train.sh reads ./hparams/$RUN_NAME.json)
+#
+# Every env value is emitted quoted: the Kubernetes API requires EnvVar.value to
+# be a string and rejects a bare integer.
 #
 # Env:
 #   TEMPLATE=<path>   job template to render (default: k8s/job_template.yaml)
 #   DRY_RUN=1         render and print, submit nothing
 #   ASSUME_YES=1      skip the confirmation prompt
+#   ALLOW_DIRTY=1     submit even if the remote does not match the working tree
 
 set -euo pipefail
 
 TEMPLATE="${TEMPLATE:-k8s/train_template.yml}"
 DRY_RUN="${DRY_RUN:-0}"
 ASSUME_YES="${ASSUME_YES:-0}"
+ALLOW_DIRTY="${ALLOW_DIRTY:-0}"
 
 die() { echo "error: $*" >&2; exit 1; }
+
+# THE JOB TEMPLATE RUNS "git clone ... && bash ./k8s/train.sh", SO THE CLUSTER
+# EXECUTES WHAT IS ON THE REMOTE, NOT THE WORKING TREE. CATCH THE MISMATCH
+# BEFORE A WHOLE SWEEP TRAINS AGAINST STALE CODE.
+check_git_sync() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+
+  local problems=() dirty ahead upstream
+
+  # THE CONTAINER READS ./hparams/$RUN_NAME.json OUT OF THE CLONE
+  if ! git ls-files --error-unmatch "$PARAMS_FILE" >/dev/null 2>&1; then
+    problems+=("$PARAMS_FILE is untracked, so the clone will not contain it")
+  fi
+
+  # ANY TRACKED EDIT MEANS THE CLONE DIFFERS FROM WHAT YOU ARE LOOKING AT
+  dirty="$(git diff --name-only HEAD 2>/dev/null | tr '\n' ' ')"
+  if [ -n "$dirty" ]; then
+    problems+=("uncommitted changes in: ${dirty% }")
+  fi
+
+  # LOCAL COMMITS NOT ON THE REMOTE YET (CACHED REF, NO FETCH -- RUN git fetch
+  # FIRST IF YOU WANT THIS TO BE AUTHORITATIVE)
+  upstream="$(git rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || true)"
+  if [ -n "$upstream" ]; then
+    ahead="$(git rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo 0)"
+    if [ "$ahead" != "0" ]; then
+      problems+=("$ahead local commit(s) not pushed to $upstream")
+    fi
+  else
+    problems+=("branch has no upstream, cannot tell what the remote holds")
+  fi
+
+  if [ "${#problems[@]}" -eq 0 ]; then
+    echo "git         : working tree matches $upstream"
+    return 0
+  fi
+
+  echo >&2
+  echo "error: the template clones the remote, so the cluster would NOT run your current code:" >&2
+  local item
+  for item in "${problems[@]}"; do echo "  - $item" >&2; done
+  echo "       commit and push, or set ALLOW_DIRTY=1 to submit anyway." >&2
+  return 1
+}
 
 usage() {
   echo "usage: $0 <params-file> <start-id> <end-id>" >&2
@@ -47,10 +97,71 @@ RUN_NAME="$(basename "$PARAMS_FILE" .json)"
 [ "$(basename "$(dirname "$PARAMS_FILE")")" = "hparams" ] \
   || die "params file must live in hparams/ so the container can find ./hparams/${RUN_NAME}.json"
 
-# TEMPLATE MUST CARRY EVERY PLACEHOLDER -- OTHERWISE WE WOULD SUBMIT N IDENTICAL JOBS
-for ph in JOB_NAME MODEL_ID RUN_NAME; do
-  grep -q "{{${ph}}}" "$TEMPLATE" || die "template $TEMPLATE has no {{${ph}}} placeholder"
-done
+# RENDER ONE JOB: REWRITE metadata.name AND THE RUN_NAME / MODEL_ID env VALUES.
+# TARGETS THE YAML STRUCTURE, SO A TEMPLATE WITH REAL VALUES IN THOSE FIELDS
+# WORKS WITHOUT PLACEHOLDER TOKENS.
+render() {
+  python3 - <<'PYRENDER'
+import os, re, sys
+
+job, mid, run = os.environ['JOB_NAME'], os.environ['MODEL_ID'], os.environ['RUN_NAME']
+lines  = open(os.environ['TEMPLATE']).read().split('\n')
+hits   = {'name': 0, 'RUN_NAME': 0, 'MODEL_ID': 0}
+quoted = []
+
+out, in_meta, key = [], False, None
+for line in lines:
+    # TOP-LEVEL metadata BLOCK -- ITS FIRST name: IS THE JOB NAME. THE OTHER
+    # name: KEYS (container, env, volumes) SIT DEEPER AND ARE LEFT ALONE.
+    if re.match(r'^metadata:\s*$', line):
+        in_meta = True
+        out.append(line)
+        continue
+    if in_meta:
+        if re.match(r'^\S', line):
+            in_meta = False
+        else:
+            m = re.match(r'^(\s+)name:\s*(\S.*)$', line)
+            if m:
+                out.append('%sname: %s' % (m.group(1), job))
+                hits['name'] += 1
+                in_meta = False
+                continue
+
+    # env ENTRY: REMEMBER THE KEY, THEN REWRITE THE value: LINE THAT FOLLOWS IT
+    m = re.match(r'^\s*-\s*name:\s*([A-Za-z_][A-Za-z0-9_]*)\s*$', line)
+    if m:
+        key = m.group(1)
+        out.append(line)
+        continue
+    if key is not None:
+        m = re.match(r'^(\s*)value:\s*(.*)$', line)
+        if m:
+            indent, cur = m.group(1), m.group(2).strip()
+            bare = cur[1:-1] if len(cur) > 1 and cur[0] == cur[-1] and cur[0] in ('"', "'") else cur
+            if key == 'RUN_NAME':
+                bare = run
+                hits['RUN_NAME'] += 1
+            elif key == 'MODEL_ID':
+                bare = mid
+                hits['MODEL_ID'] += 1
+            elif cur == bare:
+                quoted.append(key)
+            out.append('%svalue: "%s"' % (indent, bare))
+            key = None
+            continue
+        key = None
+    out.append(line)
+
+for field, n in hits.items():
+    if n != 1:
+        sys.exit('error: expected exactly one %s field in the template, found %d' % (field, n))
+if quoted:
+    sys.stderr.write('  note: quoted bare env value(s) %s -- worth fixing in the template\n'
+                     % ', '.join(quoted))
+open(os.environ['RENDERED'], 'w').write('\n'.join(out))
+PYRENDER
+}
 
 # IDS PRESENT IN THE PARAMS FILE (JSON LINES, ONE OBJECT PER MODEL)
 declare -A HAS_ID=()
@@ -94,9 +205,19 @@ else
   echo "context     : $(kubectl config current-context 2>/dev/null || echo 'unknown')"
 fi
 
+# THE CLUSTER RUNS THE REMOTE, NOT THIS DIRECTORY
+if [ "$DRY_RUN" != "1" ]; then
+  if ! check_git_sync && [ "$ALLOW_DIRTY" != "1" ]; then
+    exit 1
+  fi
+fi
+
 # CONFIRM BEFORE PUSHING JOBS TO A CLUSTER
 if [ "$DRY_RUN" != "1" ] && [ "$ASSUME_YES" != "1" ]; then
-  read -r -p "Submit ${#TO_LAUNCH[@]} job(s) to the context above? [y/N] " reply
+  # A FAILED read UNDER set -e WOULD KILL THE SCRIPT SILENTLY, SO SAY WHY
+  if ! read -r -p "Submit ${#TO_LAUNCH[@]} job(s) to the context above? [y/N] " reply; then
+    die "no terminal to confirm on -- set ASSUME_YES=1 to submit non-interactively"
+  fi
   case "$reply" in [yY]|[yY][eE][sS]) ;; *) echo "aborted"; exit 1;; esac
 fi
 
@@ -114,15 +235,9 @@ for MODEL_ID in "${TO_LAUNCH[@]}"; do
   # DNS LABELS CAP AT 63 CHARACTERS
   [ "${#JOB_NAME}" -le 63 ] || die "job name '$JOB_NAME' exceeds the 63 character limit"
 
-  sed -e "s|{{JOB_NAME}}|${JOB_NAME}|g" \
-      -e "s|{{MODEL_ID}}|${MODEL_ID}|g" \
-      -e "s|{{RUN_NAME}}|${RUN_NAME}|g" \
-      "$TEMPLATE" > "$RENDERED"
-
-  # ANY PLACEHOLDER LEFT BEHIND MEANS THE TEMPLATE WANTS SOMETHING WE DO NOT SUBSTITUTE
-  if grep -oE '\{\{[A-Za-z0-9_]+\}\}' "$RENDERED" | sort -u | grep . >/dev/null; then
-    die "unsubstituted placeholder(s) in $TEMPLATE: $(grep -oE '\{\{[A-Za-z0-9_]+\}\}' "$RENDERED" | sort -u | tr '\n' ' ')"
-  fi
+  JOB_NAME="$JOB_NAME" MODEL_ID="$MODEL_ID" RUN_NAME="$RUN_NAME" \
+  TEMPLATE="$TEMPLATE" RENDERED="$RENDERED" render \
+    || die "could not render $TEMPLATE for $JOB_NAME"
 
   if [ "$DRY_RUN" = "1" ]; then
     echo "--- $JOB_NAME (MODEL_ID=$MODEL_ID, RUN_NAME=$RUN_NAME) ---"

@@ -6,9 +6,13 @@ set -euo pipefail
 : "${WORKERS:?Set WORKERS env var}"
 : "${MODEL_ID:?Set MODEL_ID env var}"
 
-MODEL_ID_PADDED=$(printf "%03d" "$MODEL_ID")
+# 10# FORCES BASE 10 -- printf TREATS A LEADING ZERO AS OCTAL, SO A PADDED
+# MODEL_ID LIKE 008 ERRORS OUT AND 010 SILENTLY BECOMES 008.
+MODEL_ID_PADDED=$(printf "%03d" "$((10#$MODEL_ID))")
 
-REPO_DIR="diabetes-barlow-twins"
+# RESOLVED FROM THIS SCRIPT, NOT THE CWD: THE JOB TEMPLATE ALREADY cd's INTO
+# THE CLONE BEFORE CALLING US, SO A RELATIVE PATH WOULD LOOK ONE LEVEL TOO DEEP.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 CHIPS_PVC="/chips_pvc"
 MODEL_PVC="/model_pvc"
@@ -64,7 +68,7 @@ trap on_exit EXIT
 
 python3 -u train.py \
   --data-dir "$DATA_DIR" \
-  --net-dir "$NET_DIR" \
+  --checkpoint-dir "$NET_DIR" \
   --log-dir "$LOG_DIR" \
   --num-workers "$WORKERS" \
   --params "$PARAMS_FILE" \

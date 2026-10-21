@@ -3,6 +3,9 @@ kind: Job
 metadata:
   name: hpo-0-000
 spec:
+
+  backoffLimit: 1
+
   template:
     spec:
 
@@ -23,7 +26,7 @@ spec:
           - name: MODEL_ID
             value: "000"
           - name: WORKERS
-            value: 8
+            value: "8"
 
         command: ["/bin/sh","-c"]
         args:
@@ -34,12 +37,12 @@ spec:
           limits:
             memory: 80Gi
             cpu: 8
-            ephemeral-storage: 45Gi
+            ephemeral-storage: 60Gi
             nvidia.com/a100: 1
           requests:
             memory: 80Gi
             cpu: 8
-            ephemeral-storage: 45Gi
+            ephemeral-storage: 60Gi
             nvidia.com/a100: 1
 
         volumeMounts:
@@ -64,7 +67,7 @@ spec:
           claimName: diabetes-chips                 
       - name: cache-vol
         emptyDir:
-          sizeLimit: 45Gi
+          sizeLimit: 60Gi
 
       restartPolicy: Never
 
