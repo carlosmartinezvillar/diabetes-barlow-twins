@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-TEMPLATE="${TEMPLATE:-k8s/job_template.yaml}"
+TEMPLATE="${TEMPLATE:-k8s/train_template.yml}"
 DRY_RUN="${DRY_RUN:-0}"
 ASSUME_YES="${ASSUME_YES:-0}"
 

@@ -87,7 +87,7 @@ def embedding_std(emb):
 	'''
 	# emb is [B,D]
 	emb = torch.nn.functional.normalize(emb.float(),dim=1) #unit-length vectors
-	return (emb.std(dim=0).mean() * emb.shape[1]**0.5).item() # SYNC
+	return (emb.std(dim=0).mean() * emb.shape[1]**0.5) # no SYNC need .item() downstream
 
 
 def unpermute2d(representation,patch_ids):
@@ -137,9 +137,13 @@ def build_table(model,dataloader,device):
 	embed_dim = model.representation_dim
 	n_tracts  = dataloader.dataset.n_tracts
 
+	# THE *_ftr.tif TRACT BAND STORES tract_index+1, KEEPING 0 FREE AS NODATA, SO
+	# BUCKETS RUN 0..n_tracts AND BUCKET 0 IS DISCARDED BELOW.
+	n_buckets = n_tracts + 1
+
 	# BUFFERS
-	embeddings = torch.zeros((n_tracts,embed_dim),device=device)
-	counts     = torch.zeros(n_tracts,dtype=torch.long,device=device)
+	embeddings = torch.zeros((n_buckets,embed_dim),device=device)
+	counts     = torch.zeros(n_buckets,dtype=torch.long,device=device)
 
 	model.eval()
 	for image,tract in dataloader:
@@ -150,21 +154,27 @@ def build_table(model,dataloader,device):
 		with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):
 			rep = model(image)
 
-		# PIXELS PER (CHIP,TRACT): [B,H*W] -> [B,n_tracts]
+		# PIXELS PER (CHIP,BUCKET): [B,H*W] -> [B,n_buckets]
 		B   = tract.shape[0]
 		t   = tract.view(B,-1).long()
-		off = torch.arange(B,device=device)[:,None]*n_tracts
-		W   = torch.bincount((t+off).flatten(),minlength=B*n_tracts).view(B,n_tracts)
+		off = torch.arange(B,device=device)[:,None]*n_buckets
+		W   = torch.bincount((t+off).flatten(),minlength=B*n_buckets).view(B,n_buckets)
 
 		# PIXEL-WEIGHTED SUM OF CHIP EMBEDDINGS PER TRACT
-		embeddings += W.T.float() @ rep.float() #[n_tracts,B] x [B,embed_dim]
+		embeddings += W.T.float() @ rep.float() #[n_buckets,B] x [B,embed_dim]
 		counts     += W.sum(0)
 
-	# KEEP TRACT IDS OF SEEN ROWS + AVERAGE
+	# KEEP SEEN ROWS, DROPPING THE NODATA BUCKET + AVERAGE
 	ids = (counts > 0).nonzero().squeeze(1)
+	ids = ids[ids > 0]
 	tract_embedding_table = embeddings[ids] / counts[ids,None]
 
-	return ids.cpu().numpy(),tract_embedding_table.cpu().numpy()
+	# SPREAD OF THE TABLE THE PROBE WILL FIT: ~1 WELL-SPREAD, ->0 UNDER COLLAPSE.
+	# PER-TRACT AND CHIP-AVERAGED, SO NOT ON THE SAME SCALE AS tstd FROM train().
+	std = embedding_std(tract_embedding_table).item()
+
+	# BACK TO 0-BASED tract_index, SO THE CALLER INDEXES load_tract_values() DIRECTLY
+	return (ids - 1).cpu().numpy(),tract_embedding_table.cpu().numpy(),std
 
 
 def score_probe(X_tr,X_va,Y_tr,Y_va):
@@ -201,7 +211,7 @@ def score_probe(X_tr,X_va,Y_tr,Y_va):
 
 def train(model,loss_fn,dataloaders,optimizer,scheduler,device):
 
-	sums = torch.zeros(3,device=device)
+	sums = torch.zeros(4,device=device)
 	batch_nr = torch.zeros(1,device=device)
 
 	model.train()
@@ -213,7 +223,7 @@ def train(model,loss_fn,dataloaders,optimizer,scheduler,device):
 
 		# FORWARD PASS
 		with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):
-			_,z1,z2 = model(X1,X2)
+			rep,z1,z2 = model(X1,X2)
 
         # z1 = unpermute1d(z1,ids1).flatten(0,1) # [B*N,D], row r = same (image,patch)
         # z2 = unpermute1d(z2,ids2).flatten(0,1)
@@ -227,15 +237,17 @@ def train(model,loss_fn,dataloaders,optimizer,scheduler,device):
 		torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 		optimizer.step()
 
-		sums += torch.stack([loss.detach(),on_diag,off_diag])
+		std = embedding_std(rep.mean(dim=(2,3))) #spread of embeddings, ~1 for well-spread, ->0 under collapse
+
+		sums += torch.stack([loss.detach(),on_diag,off_diag,std])
 		batch_nr += 1
 
 	if scheduler is not None:
 		scheduler.step() #step per epoch
 
-	loss,diag,offd = (sums/batch_nr).tolist() # --- GPU-CPU SYNC ---
-	print(f'[T] LOSS: {loss:.5f} | ON_DIAG: {diag:.5f} | OFF_DIAG: {offd:.5f}')
-	return {'tloss':loss,'tdiag':diag,'toffd':offd}
+	loss,diag,offd,std = (sums/batch_nr).tolist() # --- GPU-CPU SYNC ---
+	print(f'[T] LOSS: {loss:.5f} | ON_DIAG: {diag:.5f} | OFF_DIAG: {offd:.5f} | STD: {std:.5f}')
+	return {'tloss':loss,'tdiag':diag,'toffd':offd,'tstd':std}
 
 
 def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,device):
@@ -267,8 +279,8 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 		if is_eval_epoch:
 
 			# BUILD TRAIN + VALIDATION TABLES
-			ids_t,avg_emb_t = build_table(model,dataloaders['training_labeled'],device)
-			ids_v,avg_emb_v = build_table(model,dataloaders['validation'],device)
+			ids_t,avg_emb_t,std_t = build_table(model,dataloaders['training_labeled'],device)
+			ids_v,avg_emb_v,std_v = build_table(model,dataloaders['validation'],device)
 
 			# HEALTH VALUES ALIGNED TO TABLE ROWS
 			Y_tr = tract_values[ids_t]
@@ -276,7 +288,10 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 
 			# FIT REGRESSION
 			scores,_,_ = score_probe(avg_emb_t,avg_emb_v,Y_tr,Y_va)
-			print(f"[V] RMSE: {scores['rmse']:.5f} | R2: {scores['r2']:.5f} | SPEARMAN: {scores['spearman']:.5f}")
+			scores['std_tr'] = std_t
+			scores['std_va'] = std_v
+			print(f"[V] RMSE: {scores['rmse']:.5f} | R2: {scores['r2']:.5f} | SPEARMAN: {scores['spearman']:.5f}"
+			      f" | STD_TR: {std_t:.5f} | STD_VA: {std_v:.5f}")
 
 		else:
 			scores = {
@@ -285,7 +300,9 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 				"r2": 'NaN',
 				"spearman": 'NaN',
 				"alpha": 'NaN',
-				"alpha_edge": 'NaN'
+				"alpha_edge": 'NaN',
+				"std_tr": 'NaN',
+				"std_va": 'NaN'
 			}
 
 		# LOG EPOCH
@@ -401,30 +418,6 @@ if __name__ == '__main__':
 	}
 
 	train_transform = dataloader.ImageTransform()
-
-	# # MEMORY MAPPED (DISK) DATASETS+DATA
-	# # PAIRED + AUGMENTED -- BARLOW TWINS TRAINING
-	# t_dload = torch.utils.data.DataLoader(
-	# 	dataset=dataloader.MappedPairedDataset(args.data_dir,transform=train_transform,split='train'),
-	# 	shuffle=True,
-	# 	drop_last=True,
-	# 	**loader_params
-	# )
-
-	# # LABELED, UNAUGMENTED -- TRAIN/VAL TABLE FOR THE PROBE
-	# t_dload_labeled = torch.utils.data.DataLoader(
-	# 	dataset=dataloader.MappedLabeledDataset(args.data_dir,split='train'),
-	# 	shuffle=False,
-	# 	drop_last=False,
-	# 	**loader_params
-	# )
-
-	# v_dload = torch.utils.data.DataLoader(
-	# 	dataset=dataloader.MappedLabeledDataset(args.data_dir,split='val'),
-	# 	shuffle=False,
-	# 	drop_last=False,
-	# 	**loader_params
-	# )
 
 	# # RAM DATASETS+DATA (~37GB)
 	print(f"Loading cached datasets to RAM from .npy files in {args.data_dir}...")
