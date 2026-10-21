@@ -61,14 +61,14 @@ def build_cached_dataset(chip_dir,feat_dir,split_csv,split,cache_dir):
 ################################################################################
 class GainScaling:
 	def __init__(self,factor=0.05):
-		self.high = 1+factor
-		self.low  = 1-factor
+		self.hi = 1+factor
+		self.lo = 1-factor
 
 	def __call__(self,x):
-		return x * torch.empty(1).uniform_(self.low,self.high).item()
+		return x * torch.empty(x.shape[0],1,1).uniform_(self.lo,self.hi)
 
 
-class BandOffset:
+class BandOffset: # redundant?
 	def __init__(self,factor=0.05):
 		self.factor = factor
 
@@ -190,20 +190,20 @@ class ImageViewTransform:
 		])
 
 		self.spectral = v2.Compose([
-			v2.RandomApply([v2.GaussianBlur(kernel_size=9,sigma=(0.1,1.0))],p=blur),
-			GainScaling(factor=0.05),
+			v2.RandomApply([v2.GaussianBlur(kernel_size=7,sigma=(0.5,1.0))],p=blur),
+			GainScaling(factor=0.10),
 		])
 
-		self.post_norm = v2.Compose([
+		# self.post_norm = v2.Compose([
 			# BandOffset(factor=0.05),
-			GaussianNoise(sigma=0.03,p=0.5)
-		])
+			# GaussianNoise(sigma=0.03,p=0.5)
+		# ])
 
 	def __call__(self,x):
 		x = self.geometric(x)
 		x = self.spectral(x/255) #applied to range 0-1
 		x = (x*255 - MEAN)/STDD #[0-255] to ~[-3,3]
-		x = self.post_norm(x) #applied to normalized values 
+		# x = self.post_norm(x) #applied to normalized values 
 		return x
 
 
@@ -227,8 +227,8 @@ class RotatedPatchTransform:
 
 class ImageTransform:
 	def __init__(self):
-		self.view_1 = ImageViewTransform(crop_size=224,blur=0.1)
-		self.view_2 = ImageViewTransform(crop_size=224,blur=0.1)
+		self.view_1 = ImageViewTransform(crop_size=192,blur=0.1)
+		self.view_2 = ImageViewTransform(crop_size=192,blur=1.0) #asymmetric blur
 
 	def __call__(self,x):
 		return self.view_1(x),self.view_2(x)
@@ -501,19 +501,26 @@ class RAMLabeledDataset(torch.utils.data.Dataset):
 ################################################################################
 # OTHER
 ################################################################################
-parser = argparse.ArgumentParser(description='Barlow Twins Dataloaders for Sentinel-2 chips.')
-parser.add_argument('--data-dir',type=str,required=True,help='Dir for chips.')
-parser.add_argument('--mask-dir',type=str,required=True,help='Dir for feature/tract masks (*_ftr.tif).')
-parser.add_argument('--cache-dir',type=str,required=True,help='Output dir')
-parser.add_argument('--split',type=str,required=True,help='train/val/test')
 
-args = parser.parse_args()
 
-assert os.path.isdir(args.data_dir), f"Data dir not found at {args.data_dir}"
-assert os.path.isdir(args.mask_dir), f"Data dir not found at {args.mask_dir}"
-assert os.path.isdir(args.cache_dir), f"Data dir not found at {args.cache_dir}"
-args.data_dir = args.data_dir.rstrip('/')
-args.mask_dir = args.mask_dir.rstrip('/')
-args.cache_dir = args.cache_dir.rstrip('/')
+################################################################################
+# MAIN
+################################################################################
+if __name__ == '__main__':
 
-build_cached_dataset(args.data_dir,args.mask_dir,'./split_chips.csv',args.split,args.cache_dir)
+	parser = argparse.ArgumentParser(description='Barlow Twins Dataloaders for Sentinel-2 chips.')
+	parser.add_argument('--data-dir',type=str,required=True,help='Dir for chips.')
+	parser.add_argument('--mask-dir',type=str,required=True,help='Dir for feature/tract masks (*_ftr.tif).')
+	parser.add_argument('--cache-dir',type=str,required=True,help='Output dir')
+	parser.add_argument('--split',type=str,required=True,help='train/val/test')
+
+	args = parser.parse_args()
+
+	assert os.path.isdir(args.data_dir), f"Data dir not found at {args.data_dir}"
+	assert os.path.isdir(args.mask_dir), f"Data dir not found at {args.mask_dir}"
+	assert os.path.isdir(args.cache_dir), f"Data dir not found at {args.cache_dir}"
+	args.data_dir = args.data_dir.rstrip('/')
+	args.mask_dir = args.mask_dir.rstrip('/')
+	args.cache_dir = args.cache_dir.rstrip('/')
+
+	build_cached_dataset(args.data_dir,args.mask_dir,'./split_chips.csv',args.split,args.cache_dir)

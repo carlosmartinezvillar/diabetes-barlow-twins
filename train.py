@@ -6,6 +6,7 @@ import time
 import argparse
 import json
 import csv
+import sys
 
 from scipy.stats import spearmanr
 from sklearn.linear_model import RidgeCV
@@ -207,8 +208,8 @@ def train(model,loss_fn,dataloaders,optimizer,scheduler,device):
 	for X1,X2 in dataloaders['training']: # (X1,ids1),(X2,ids2) for patched+rotated
 
 		#TO DEV
-		X1 = X1.to(device,non_blocking=True,memory_format=torch.channels_last)
-		X2 = X2.to(device,non_blocking=True,memory_format=torch.channels_last)
+		X1 = X1.to(device,non_blocking=True)
+		X2 = X2.to(device,non_blocking=True)
 
 		# FORWARD PASS
 		with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):
@@ -380,7 +381,7 @@ if __name__ == '__main__':
 		init_chan=hp['init_chan'],
 		cnn_layers=hp['cnn_layers'],
 		proj_dim=hp['proj_dim']
-	).to(device,memory_format=torch.channels_last)
+	).to(device)
 
 	bt_net = torch.compile(bt_net)
 
@@ -394,58 +395,58 @@ if __name__ == '__main__':
 	loader_params = {
 		'batch_size': hp['batch'],
 		'num_workers': args.num_workers,
+		'pin_memory': True,
+		'prefetch_factor': 4,
+		'persistent_workers': True
 	}
-	if args.num_workers > 0:
-		loader_params.update(prefetch_factor=4,persistent_workers=True)
 
 	train_transform = dataloader.ImageTransform()
 
 	# PAIRED + AUGMENTED -- BARLOW TWINS TRAINING
-	t_dload = torch.utils.data.DataLoader(
-		dataset=dataloader.MappedPairedDataset(args.data_dir,transform=train_transform,split='train'),
-		shuffle=True,
-		drop_last=True,
-		**loader_params
-	)
-
-	# LABELED, UNAUGMENTED -- TRAIN/VAL TABLE FOR THE PROBE
-	t_dload_labeled = torch.utils.data.DataLoader(
-		dataset=dataloader.MappedLabeledDataset(args.data_dir,split='train'),
-		shuffle=False,
-		drop_last=False,
-		**loader_params
-	)
-
-	v_dload = torch.utils.data.DataLoader(
-		dataset=dataloader.MappedLabeledDataset(args.data_dir,split='val'),
-		shuffle=False,
-		drop_last=False,
-		**loader_params
-	)
-
-
 	# t_dload = torch.utils.data.DataLoader(
-	# 	dataset=dataloader.RAMPairedDataset(args.data_dir,transform=train_transform,split='train'),
+	# 	dataset=dataloader.MappedPairedDataset(args.data_dir,transform=train_transform,split='train'),
 	# 	shuffle=True,
 	# 	drop_last=True,
 	# 	**loader_params
 	# )
 
-	# # LABELED, UNAUGMENTED -- TRAIN TABLE FOR THE PROBE
+	# # LABELED, UNAUGMENTED -- TRAIN/VAL TABLE FOR THE PROBE
 	# t_dload_labeled = torch.utils.data.DataLoader(
-	# 	dataset=dataloader.RAMLabeledDataset(args.data_dir,split='train'),
+	# 	dataset=dataloader.MappedLabeledDataset(args.data_dir,split='train'),
 	# 	shuffle=False,
 	# 	drop_last=False,
 	# 	**loader_params
 	# )
 
 	# v_dload = torch.utils.data.DataLoader(
-	# 	dataset=dataloader.RAMLabeledDataset(args.data_dir,split='val'),
+	# 	dataset=dataloader.MappedLabeledDataset(args.data_dir,split='val'),
 	# 	shuffle=False,
 	# 	drop_last=False,
 	# 	**loader_params
 	# )
 
+
+	t_dload = torch.utils.data.DataLoader(
+		dataset=dataloader.RAMPairedDataset(args.data_dir,transform=train_transform,split='train'),
+		shuffle=True,
+		drop_last=True,
+		**loader_params
+	)
+
+	# LABELED, UNAUGMENTED -- TRAIN TABLE FOR THE PROBE
+	t_dload_labeled = torch.utils.data.DataLoader(
+		dataset=dataloader.RAMLabeledDataset(args.data_dir,split='train'),
+		shuffle=False,
+		drop_last=True,
+		**loader_params
+	)
+
+	v_dload = torch.utils.data.DataLoader(
+		dataset=dataloader.RAMLabeledDataset(args.data_dir,split='val'),
+		shuffle=False,
+		drop_last=True,
+		**loader_params
+	)
 
 	dataloaders = {'training': t_dload,'training_labeled': t_dload_labeled,'validation': v_dload}
 
