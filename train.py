@@ -186,6 +186,14 @@ def score_probe(X_tr,X_va,Y_tr,Y_va):
 	X_tr,Y_tr = X_tr[m_tr],Y_tr[m_tr]
 	X_va,Y_va = X_va[m_va],Y_va[m_va]
 
+	# THE TABLE COMES IN AS float32 AND sklearn KEEPS THAT DTYPE ALL THE WAY INTO THE
+	# CHOLESKY SOLVE OF (X^T X + alpha I). EMBEDDING DIMS ARE HIGHLY CORRELATED AND THE
+	# SMALLEST alpha IS 1, SO cond(A) ~1e7 -- BELOW float32 eps (1.2e-7), WHICH IS WHAT
+	# TRIGGERS LinAlgWarning AND MAKES THE FITTED COEFFICIENTS (NOT SO MUCH THE
+	# PREDICTIONS) UNRELIABLE. float64 COPY IS ~200MB/CHEAP.
+	X_tr,X_va = X_tr.astype(np.float64),X_va.astype(np.float64)
+	Y_tr,Y_va = Y_tr.astype(np.float64),Y_va.astype(np.float64)
+
 	# DEFAULT
 	alphas = np.logspace(start=0,stop=6,num=8)
 	folds = list(KFold(n_splits=3, shuffle=True, random_state=0).split(X_tr))
