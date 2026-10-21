@@ -20,6 +20,18 @@ spec:
         image: docker.io/cimartinezvillar/dcnn-pytorch:cuda12.4base-ubuntu22.04
         imagePullPolicy: Always
 
+        resources:
+          limits:
+            memory: 80Gi
+            cpu: 8
+            ephemeral-storage: 60Gi
+            nvidia.com/a100: 1
+          requests:
+            memory: 80Gi
+            cpu: 8
+            ephemeral-storage: 60Gi
+            nvidia.com/a100: 1
+
         env:
           - name: RUN_NAME
             value: "hpo_0"
@@ -33,18 +45,6 @@ spec:
           - |
             git clone https://github.com/carlosmartinezvillar/diabetes-barlow-twins && cd diabetes-barlow-twins && bash ./k8s/train.sh
 
-        resources:
-          limits:
-            memory: 80Gi
-            cpu: 8
-            ephemeral-storage: 60Gi
-            nvidia.com/a100: 1
-          requests:
-            memory: 80Gi
-            cpu: 8
-            ephemeral-storage: 60Gi
-            nvidia.com/a100: 1
-
         volumeMounts:
         - mountPath: /chips_pvc
           name: chips-vol
@@ -54,6 +54,8 @@ spec:
           name: model-vol
         - mountPath: /log_pvc
           name: log-vol
+        - mountPath: /dev/shm
+          name: dshm
 
       volumes:
       - name: model-vol
@@ -68,6 +70,11 @@ spec:
       - name: cache-vol
         emptyDir:
           sizeLimit: 60Gi
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8G
+
 
       restartPolicy: Never
 
