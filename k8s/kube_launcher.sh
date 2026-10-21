@@ -163,24 +163,23 @@ open(os.environ['RENDERED'], 'w').write('\n'.join(out))
 PYRENDER
 }
 
-# IDS PRESENT IN THE PARAMS FILE (JSON LINES, ONE OBJECT PER MODEL)
-declare -A HAS_ID=()
-while read -r id; do HAS_ID["$id"]=1; done < <(
-  python3 -c '
+# IDS PRESENT IN THE PARAMS FILE (JSON LINES, ONE OBJECT PER MODEL), AS " 0 1 2 ".
+# A DELIMITED STRING RATHER THAN declare -A: macOS /bin/bash IS 3.2, WHICH HAS
+# NO ASSOCIATIVE ARRAYS.
+HAS_IDS=" $(python3 -c '
 import json,sys
 for line in open(sys.argv[1]):
     line = line.strip()
     if line:
         print(json.loads(line)["id"])
-' "$PARAMS_FILE"
-)
-[ "${#HAS_ID[@]}" -gt 0 ] || die "no ids found in $PARAMS_FILE"
+' "$PARAMS_FILE" | tr '\n' ' ')"
+[ -n "${HAS_IDS// /}" ] || die "no ids found in $PARAMS_FILE"
 
 # SPLIT THE REQUESTED RANGE INTO WHAT EXISTS AND WHAT DOES NOT
 TO_LAUNCH=()
 MISSING=()
 for ((id=START_ID; id<=END_ID; id++)); do
-  if [ -n "${HAS_ID[$id]:-}" ]; then TO_LAUNCH+=("$id"); else MISSING+=("$id"); fi
+  case "$HAS_IDS" in *" $id "*) TO_LAUNCH+=("$id");; *) MISSING+=("$id");; esac
 done
 [ "${#TO_LAUNCH[@]}" -gt 0 ] || die "none of the ids ${START_ID}..${END_ID} exist in $PARAMS_FILE"
 
