@@ -422,7 +422,7 @@ if __name__ == '__main__':
 		'num_workers': args.num_workers,
 		'pin_memory': True,
 		'prefetch_factor': 2,
-		'persistent_workers': False
+		'persistent_workers': True
 	}
 
 	train_transform = dataloader.ImageTransform()
