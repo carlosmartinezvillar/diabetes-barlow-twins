@@ -55,6 +55,18 @@ def build_cached_dataset(chip_dir,feat_dir,split_csv,split,cache_dir):
 	with open(f"{cache_dir}/{split}_ids.txt",'w') as fp:
 		fp.write('\n'.join(chips))
 
+def load_cached_split(cache_dir,split):
+	'''
+	Loads dataset split from previously disk-cached .npy file.
+	This is used to load a given split to RAM and passing it as arguments to 
+	dataloaders. This prevents duplicate data, allowing distinct Dataset 
+	objects to sharing a single in-memory array.    
+	'''
+	rgb = np.load(f"{cache_dir}/{split}_rgb.npy")
+	trc = np.load(f"{cache_dir}/{split}_trc.npy")
+	# lbl = np.load(f"{cache_dir}/{split}_lbl.npy",mmap_mode='r') #not needed now
+	return rgb,trc
+
 
 ################################################################################
 # AUGMENTATIONS
@@ -319,6 +331,7 @@ class GPUImageViewTransform(torch.nn.Module):
 
 		return x	
 
+
 ################################################################################
 # DATASET CLASSES
 ################################################################################
@@ -441,14 +454,14 @@ class MappedLabeledDataset(torch.utils.data.Dataset):
 
 
 class RAMPairedDataset(torch.utils.data.Dataset):
-	def __init__(self,cache_dir,transform,split='train'):
-		self.path = f"{cache_dir}/{split}_rgb.npy"
+	def __init__(self,band_array,transform,split='train'):
+
+		# AUGMENTATIONS
 		self.transform = transform
 
-		print("Loading cached dataset to RAM...")
-		self.rgb = torch.from_numpy(np.load(self.path))
+		# LOAD DATASET
+		self.rgb = torch.from_numpy(band_array)
 		self.n   = self.rgb.shape[0]
-		print("Loaded to RAM")
 
 
 	def __len__(self):
@@ -462,16 +475,14 @@ class RAMPairedDataset(torch.utils.data.Dataset):
 
 class RAMLabeledDataset(torch.utils.data.Dataset):
 
-	def __init__(self,cache_dir,split='val'):
+	def __init__(self,band_array,tract_array,split='val'):
 
+		# SOME METADATA
 		self.chips,self.n_tracts = read_split('./split_chips.csv',split)
 
 		# LOAD DATASET
-		print("Loading cached dataset to RAM...")
-		self.rgb = torch.from_numpy(np.load(f"{cache_dir}/{split}_rgb.npy"))
-		self.lbl = torch.from_numpy(np.load(f"{cache_dir}/{split}_lbl.npy"))
-		self.trc = torch.from_numpy(np.load(f"{cache_dir}/{split}_trc.npy"))
-		print("Loaded to RAM")
+		self.rgb = torch.from_numpy(band_array)
+		self.trc = torch.from_numpy(tract_array)
 
 		# SIZE
 		self.n = self.rgb.shape[0]
@@ -485,23 +496,24 @@ class RAMLabeledDataset(torch.utils.data.Dataset):
 
 		# LOAD FROM ARRAY IN RAM
 		bands = self.rgb[idx]
-		label = self.lbl[idx]
+		# label = self.lbl[idx]
 		tract = self.trc[idx]
 
 		# ADJUST
 		bands = tv_tensors.Image(bands.to(torch.float32))
-		label = torch.squeeze(label,0).to(torch.float32).div(1000)
+		# label = torch.squeeze(label,0).to(torch.float32).div(1000)
 		tract = torch.squeeze(tract,0).to(torch.uint16)
 
 		# NORMALIZE BANDS
 		bands = (bands-MEAN)/STDD
 
-		return bands, label, tract
+		return bands, tract
 
 ################################################################################
 # OTHER
 ################################################################################
-
+def check_batch_size():
+	pass
 
 ################################################################################
 # MAIN

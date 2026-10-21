@@ -55,7 +55,7 @@ class RecentBestTracker():
 
 
 def save_checkpoint(path,model,optim,epoch,metrics,tag):
-	save_path = f"{path}/{tag}_{model.model_id:03}_e{epoch:03}.pth.tar"
+	save_path = f"{path}/{tag}_{model.model_id:03}_e{epoch:04}.pth.tar"
 
 	raw_model = model._orig_mod if hasattr(model,'_orig_mod') else model
 
@@ -142,7 +142,7 @@ def build_table(model,dataloader,device):
 	counts     = torch.zeros(n_tracts,dtype=torch.long,device=device)
 
 	model.eval()
-	for image,label,tract in dataloader:
+	for image,tract in dataloader:
 
 		image = image.to(device,non_blocking=True)
 		tract = tract.to(device,non_blocking=True)
@@ -254,14 +254,13 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 	overall_t0 = time.perf_counter()
 	for epoch in range(epochs):
 
-		print(f'--- EPOCH {epoch:03} ---')
+		print(f'--- EPOCH {epoch:04} ---')
 		epoch_time_t0 = time.perf_counter()
 
 		# TRAIN
 		train_time_t0 = time.perf_counter()
 		tr_result = train(model,loss_fn,dataloaders,optimizer,scheduler,device)
 		train_time_t1 = time.perf_counter()
-		print(f"Train time: {train_time_t1-train_time_t0:.2f} secs.")
 
 		# EVERY 10 EPOCHS -- VALIDATE: BUILD PER-TRACT EMBEDDINGS, FIT PROBE, PREDICT DIABETES
 		is_eval_epoch = (epoch+1) % 10 == 0
@@ -301,6 +300,7 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 			chkpt_tracker.update(path)
 
 		epoch_time_t1 = time.perf_counter()
+		print(f"Train time: {train_time_t1-train_time_t0:.2f} secs.")
 		print(f"Epoch time: {epoch_time_t1-epoch_time_t0:.2f} secs.")
 
 	# STDOUT TIME/OVERALL BEST/VRAM
@@ -402,7 +402,8 @@ if __name__ == '__main__':
 
 	train_transform = dataloader.ImageTransform()
 
-	# PAIRED + AUGMENTED -- BARLOW TWINS TRAINING
+	# # MEMORY MAPPED (DISK) DATASETS+DATA
+	# # PAIRED + AUGMENTED -- BARLOW TWINS TRAINING
 	# t_dload = torch.utils.data.DataLoader(
 	# 	dataset=dataloader.MappedPairedDataset(args.data_dir,transform=train_transform,split='train'),
 	# 	shuffle=True,
@@ -425,9 +426,18 @@ if __name__ == '__main__':
 	# 	**loader_params
 	# )
 
+	# # RAM DATASETS+DATA (~37GB)
+	print(f"Loading cached datasets to RAM from .npy files in {args.data_dir}...")
+	t0_disk_to_ram = time.perf_counter()
+	tr_bands,tr_tracts = dataloader.load_cached_split(args.data_dir,split='train')
+	va_bands,va_tracts = dataloader.load_cached_split(args.data_dir,split='val')
+	t1_disk_to_ram = time.perf_counter()
+	print("Loaded to RAM! -- ",end='')
+	print(f"{t1_disk_to_ram-t0_disk_to_ram:.2f} secs.")
 
+	# PAIRED + AUGMENTED -- BARLOW TWINS TRAINING
 	t_dload = torch.utils.data.DataLoader(
-		dataset=dataloader.RAMPairedDataset(args.data_dir,transform=train_transform,split='train'),
+		dataset=dataloader.RAMPairedDataset(tr_bands,transform=train_transform,split='train'),
 		shuffle=True,
 		drop_last=True,
 		**loader_params
@@ -435,16 +445,16 @@ if __name__ == '__main__':
 
 	# LABELED, UNAUGMENTED -- TRAIN TABLE FOR THE PROBE
 	t_dload_labeled = torch.utils.data.DataLoader(
-		dataset=dataloader.RAMLabeledDataset(args.data_dir,split='train'),
+		dataset=dataloader.RAMLabeledDataset(tr_bands,tr_tracts,split='train'),
 		shuffle=False,
-		drop_last=True,
+		drop_last=False,
 		**loader_params
 	)
 
 	v_dload = torch.utils.data.DataLoader(
-		dataset=dataloader.RAMLabeledDataset(args.data_dir,split='val'),
+		dataset=dataloader.RAMLabeledDataset(va_bands,va_tracts,split='val'),
 		shuffle=False,
-		drop_last=True,
+		drop_last=False,
 		**loader_params
 	)
 
