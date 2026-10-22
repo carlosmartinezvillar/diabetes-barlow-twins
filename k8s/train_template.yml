@@ -23,12 +23,12 @@ spec:
         resources:
           limits:
             memory: 96Gi
-            cpu: 8
+            cpu: 10
             ephemeral-storage: 60Gi
             nvidia.com/a100: 1
           requests:
             memory: 96Gi
-            cpu: 8
+            cpu: 10
             ephemeral-storage: 60Gi
             nvidia.com/a100: 1
 
@@ -38,7 +38,7 @@ spec:
           - name: MODEL_ID
             value: "000"
           - name: WORKERS
-            value: "8"
+            value: "10"
 
         command: ["/bin/sh","-c"]
         args:
