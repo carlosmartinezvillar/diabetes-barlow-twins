@@ -426,10 +426,11 @@ if __name__ == '__main__':
 	print(f"{t1_disk_to_ram-t0_disk_to_ram:.2f} secs.")
 
 	# PRINT RAM USAGE -- TODO: PSUTIL NOT INSTALLED IN THE K8S IMAGE
-	# pid = os.getpid()
-	# python_process = psutil.Process(pid)
-	# mem_bytes = python_process.memory_info().rss
-	# mem_gb = mem_bytes / (1024 ** 3)
+	pid = os.getpid()
+	python_process = psutil.Process(pid)
+	mem_bytes = python_process.memory_info().rss
+	mem_gb = mem_bytes / (1024 ** 3)
+	print(f"RAM GB USED: {mem_gb}")
 
 
 	train_transform = dataloader.ImageTransform()

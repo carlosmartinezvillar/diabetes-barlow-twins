@@ -73,7 +73,7 @@ spec:
       - name: dshm
         emptyDir:
           medium: Memory
-          sizeLimit: 16G #at batch 128! 
+          sizeLimit: 16G # maxed out at batch 128! 
 
 
       restartPolicy: Never
