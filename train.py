@@ -416,17 +416,6 @@ if __name__ == '__main__':
 	# OPTIMIZER
 	optimizer = torch.optim.AdamW(bt_net.parameters(),lr=hp['lrate'],weight_decay=hp['decay'])
 
-	# DATALOADERS
-	loader_params = {
-		'batch_size': hp['batch'],
-		'num_workers': args.num_workers,
-		'pin_memory': True,
-		'prefetch_factor': 2,
-		'persistent_workers': True
-	}
-
-	train_transform = dataloader.ImageTransform()
-
 	# # RAM DATASETS+DATA (~37GB)
 	print(f"Loading cached datasets to RAM from .npy files in {args.data_dir}...")
 	t0_disk_to_ram = time.perf_counter()
@@ -435,6 +424,24 @@ if __name__ == '__main__':
 	t1_disk_to_ram = time.perf_counter()
 	print("Loaded to RAM! -- ",end='')
 	print(f"{t1_disk_to_ram-t0_disk_to_ram:.2f} secs.")
+
+	# PRINT RAM USAGE -- TODO: PSUTIL NOT INSTALLED IN THE K8S IMAGE
+	# pid = os.getpid()
+	# python_process = psutil.Process(pid)
+	# mem_bytes = python_process.memory_info().rss
+	# mem_gb = mem_bytes / (1024 ** 3)
+
+
+	train_transform = dataloader.ImageTransform()
+
+	# DATALOADERS
+	loader_params = {
+		'batch_size': hp['batch'],
+		'num_workers': args.num_workers,
+		'pin_memory': True,
+		'prefetch_factor': 4,
+		'persistent_workers': True
+	}
 
 	# PAIRED + AUGMENTED -- BARLOW TWINS TRAINING
 	t_dload = torch.utils.data.DataLoader(

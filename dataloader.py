@@ -249,38 +249,44 @@ class ImageTransform:
 class GPUImageViewTransform(torch.nn.Module):
 
 	'''
-	On GPU transform.
+	On-GPU equivalent of ImageViewTransform. Takes a whole uint8 batch
+	[B,10,256,256] already on the device and returns the augmented, normalized
+	float32 batch [B,10,crop,crop].
+
+	Defaults reproduce ImageViewTransform(crop_size=192,blur=0.1): same crop,
+	same blur kernel/sigma, same gain, and offset/noise off (post_norm is
+	commented out in the CPU class). Pass offset/noise explicitly to enable them.
+
 	Use:
-
-	aug = dataloader.FastImageViewTransform().to(device)
-	for x in dataloader:
-		x = x.to(device)
-		X1,X2 = aug(x),aug(x)
+		aug = dataloader.GPUImageTransform().to(device)
+		for x in loader:                      # x is uint8 [B,10,256,256]
+			x = x.to(device,non_blocking=True)
+			X1,X2 = aug(x)
 	'''
-	def __init__(self):
+	def __init__(self,crop=192,blur=0.1,ksize=7,sigma=(0.5,1.0),gain=0.10,
+	             offset=0.0,noise=0.0,noise_p=0.5):
 		super().__init__()
-		self.crop = 192
-		self.blur = 0.1
-		self.ksize = 9
-		self.sigma = (0.1,1.0)
-
-		self.gain = 0.05
-		self.offset = 0.05
-		self.noise  = 0.03
-		self.noise_p = 0.5
+		self.crop    = crop
+		self.blur    = blur
+		self.ksize   = ksize
+		self.sigma   = sigma
+		self.gain    = gain
+		self.offset  = offset
+		self.noise   = noise
+		self.noise_p = noise_p
 
 		self.register_buffer('mean',MEAN.clone())
 		self.register_buffer('stdd',STDD.clone())
 
 	def geometric(self,x):
-		# CROP + FLIP
+		# PER-SAMPLE CROP ORIGIN + THE 8 DIHEDRAL ELEMENTS (FLIPS x TRANSPOSE),
+		# AS ONE GATHER. KEPT IN THE INPUT DTYPE SO uint8 IS CAST AFTER CROPPING.
 		B,C,H,W = x.shape
 		S,dev = self.crop,x.device
 		top = torch.randint(0,H-S+1,(B,1),device=dev)
 		left = torch.randint(0,W-S+1,(B,1),device=dev)
 		i = torch.arange(S,device=dev).expand(B,S)
 
-		#FLIP
 		flip_v,flip_h,transp = (torch.rand(3,B,1,device=dev) < 0.5)
 		rows = top  + torch.where(flip_v,S-1-i,i)
 		cols = left + torch.where(flip_h,S-1-i,i)
@@ -298,7 +304,7 @@ class GPUImageViewTransform(torch.nn.Module):
 		pick = torch.rand(B,device=x.device) < self.blur
 		n = int(pick.sum())
 		if n == 0:
-		        return x
+			return x
 		sig = torch.empty(n,1,device=x.device).uniform_(*self.sigma)
 		k   = torch.arange(self.ksize,device=x.device) - (self.ksize-1)/2
 		w   = torch.exp(-0.5*(k/sig)**2); w = w/w.sum(1,keepdim=True)
@@ -314,22 +320,42 @@ class GPUImageViewTransform(torch.nn.Module):
 	@torch.no_grad()
 	def forward(self,x):
 		B,dev = x.shape[0],x.device
+
+		# CROP/FLIP/ROTATE, THEN CAST: ONLY THE cropxcrop WINDOW BECOMES float32
 		x = self.geometric(x).float()
-		x = self.gaussian_blur(x)
-		
-		# GAIN
-		x = x * torch.empty(B,1,1,1,device=dev).uniform_(1-self.gain,1+self.gain)
+
+		# BLUR AND GAIN ARE BOTH LINEAR, SO APPLYING THEM TO THE RAW 0-255 RANGE
+		# AND NORMALIZING AFTER MATCHES THE CPU ORDER (blur/gain on x/255, then *255)
+		if self.blur > 0:
+			x = self.gaussian_blur(x)
+		if self.gain > 0:
+			x = x * torch.empty(B,1,1,1,device=dev).uniform_(1-self.gain,1+self.gain)
 
 		# NORMALIZE
 		x = (x-self.mean)/self.stdd
 
-		# BAND OFFSET
-		x = x + self.offset*(torch.randint(0,2,(B,1,1,1),device=dev)*2-1)
+		# POST-NORM (OFF BY DEFAULT, MATCHING THE COMMENTED-OUT CPU post_norm)
+		# if self.offset > 0:
+			# x = x + self.offset*(torch.randint(0,2,(B,1,1,1),device=dev)*2-1)
+		# if self.noise > 0:
+			# x = x + self.noise * torch.randn_like(x)*(torch.rand(B,1,1,1,device=dev) < self.noise_p)
 
-		# GAUSSIAN NOISE
-		x = x + self.noise * torch.randn_like(x)*(torch.rand(B,1,1,1,device=dev) < self.noise_p)
+		return x
 
-		return x	
+
+class GPUImageTransform(torch.nn.Module):
+	'''
+	GPU counterpart of ImageTransform: two views with asymmetric blur.
+	Takes the uint8 batch, returns (X1,X2) float32.
+	'''
+	def __init__(self,crop=192):
+		super().__init__()
+		self.view_1 = GPUImageViewTransform(crop=crop,blur=0.1)
+		self.view_2 = GPUImageViewTransform(crop=crop,blur=1.0) #asymmetric blur
+
+	@torch.no_grad()
+	def forward(self,x):
+		return self.view_1(x),self.view_2(x)
 
 
 ################################################################################
