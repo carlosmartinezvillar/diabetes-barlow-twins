@@ -22,12 +22,12 @@ spec:
 
         resources:
           limits:
-            memory: 80Gi
+            memory: 96Gi
             cpu: 8
             ephemeral-storage: 60Gi
             nvidia.com/a100: 1
           requests:
-            memory: 80Gi
+            memory: 96Gi
             cpu: 8
             ephemeral-storage: 60Gi
             nvidia.com/a100: 1
@@ -73,7 +73,7 @@ spec:
       - name: dshm
         emptyDir:
           medium: Memory
-          sizeLimit: 16G
+          sizeLimit: 16G #at batch 128! 
 
 
       restartPolicy: Never
