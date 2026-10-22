@@ -55,6 +55,7 @@ def build_cached_dataset(chip_dir,feat_dir,split_csv,split,cache_dir):
 	with open(f"{cache_dir}/{split}_ids.txt",'w') as fp:
 		fp.write('\n'.join(chips))
 
+
 def load_cached_split(cache_dir,split):
 	'''
 	Loads dataset split from previously disk-cached .npy file.
@@ -263,17 +264,16 @@ class GPUImageViewTransform(torch.nn.Module):
 			x = x.to(device,non_blocking=True)
 			X1,X2 = aug(x)
 	'''
-	def __init__(self,crop=192,blur=0.1,ksize=7,sigma=(0.5,1.0),gain=0.10,
-	             offset=0.0,noise=0.0,noise_p=0.5):
+	def __init__(self,crop=192,blur=0.1,ksize=7,sigma=(0.5,1.0),gain=0.10):
 		super().__init__()
 		self.crop    = crop
 		self.blur    = blur
 		self.ksize   = ksize
 		self.sigma   = sigma
 		self.gain    = gain
-		self.offset  = offset
-		self.noise   = noise
-		self.noise_p = noise_p
+		# self.offset  = offset
+		# self.noise   = noise
+		# self.noise_p = noise_p
 
 		self.register_buffer('mean',MEAN.clone())
 		self.register_buffer('stdd',STDD.clone())
@@ -356,6 +356,22 @@ class GPUImageTransform(torch.nn.Module):
 	@torch.no_grad()
 	def forward(self,x):
 		return self.view_1(x),self.view_2(x)
+
+
+class GPUValidationTransform(torch.nn.Module):
+	'''
+	GPU counterpart of the band normalization in RAMLabeledDataset: no
+	augmentation, only cast + normalize. Takes the uint8 batch [B,10,H,W]
+	already on the device, returns float32.
+	'''
+	def __init__(self):
+		super().__init__()
+		self.register_buffer('mean',MEAN.clone())
+		self.register_buffer('stdd',STDD.clone())
+
+	@torch.no_grad()
+	def forward(self,x):
+		return (x.float()-self.mean)/self.stdd
 
 
 ################################################################################
@@ -480,10 +496,10 @@ class MappedLabeledDataset(torch.utils.data.Dataset):
 
 
 class RAMPairedDataset(torch.utils.data.Dataset):
-	def __init__(self,band_array,transform,split='train'):
+	def __init__(self,band_array,split='train'):
 
-		# AUGMENTATIONS
-		self.transform = transform
+		# AUGMENTATIONS -- moved to gpu
+		# self.transform = transform
 
 		# LOAD DATASET
 		self.rgb = torch.from_numpy(band_array)
@@ -495,8 +511,9 @@ class RAMPairedDataset(torch.utils.data.Dataset):
 
 
 	def __getitem__(self,idx):
-		img = self.rgb[idx].to(torch.float32)
-		return self.transform(tv_tensors.Image(img))
+		# img = self.rgb[idx].to(torch.float32)
+		# return self.transform(tv_tensors.Image(img))
+		return self.rgb[idx] #return uint8 for augmentations in GPU.
 
 
 class RAMLabeledDataset(torch.utils.data.Dataset):
@@ -526,14 +543,14 @@ class RAMLabeledDataset(torch.utils.data.Dataset):
 		tract = self.trc[idx]
 
 		# ADJUST
-		bands = tv_tensors.Image(bands.to(torch.float32))
+		# bands = tv_tensors.Image(bands.to(torch.float32))
 		# label = torch.squeeze(label,0).to(torch.float32).div(1000)
 		tract = torch.squeeze(tract,0).to(torch.uint16)
 
-		# NORMALIZE BANDS
-		bands = (bands-MEAN)/STDD
+		# NORMALIZE BANDS -- moved to gpu (GPUValidationTransform)
+		# bands = (bands-MEAN)/STDD
 
-		return bands, tract
+		return bands, tract #bands as uint8 for normalization in GPU.
 
 ################################################################################
 # OTHER

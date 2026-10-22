@@ -8,6 +8,8 @@ import json
 import csv
 import sys
 import psutil
+import shutil
+import math
 
 from scipy.stats import spearmanr
 from sklearn.linear_model import RidgeCV
@@ -21,7 +23,9 @@ import dataloader
 MODEL_DIR = None
 LOG_DIR = None
 
-
+################################################################################
+# LOGGING
+################################################################################
 class Logger():
 	def __init__(self,path):
 		self.path = path
@@ -72,6 +76,9 @@ def save_checkpoint(path,model,optim,epoch,metrics,tag):
 	return save_path
 
 
+################################################################################
+# HELPERS
+################################################################################
 def set_seed(seed):
 	np.random.seed(seed)
 	random.seed(seed)
@@ -80,15 +87,12 @@ def set_seed(seed):
 		torch.cuda.manual_seed_all(seed)
 
 
-@torch.no_grad()
-def embedding_std(emb):
-	'''
-	Mean per-dimension std of l2-normalized embeddings, scaled by sqrt(D).
-	~1 for well-spread embeddings, ->0 under collapse.
-	'''
-	# emb is [B,D]
-	emb = torch.nn.functional.normalize(emb.float(),dim=1) #unit-length vectors
-	return (emb.std(dim=0).mean() * emb.shape[1]**0.5) # no SYNC need .item() downstream
+def report_worker_ram(proc):
+    procs = [proc] + proc.children(recursive=True)        # main + DataLoader workers
+    pss = sum(p.memory_full_info().pss for p in procs)    # shared pages split, not double-counted
+    shm = shutil.disk_usage('/dev/shm').used
+    gib = 1024 ** 3
+    print(f"RAM main+{len(procs)-1} workers (PSS): {pss/gib:.1f} GiB | /dev/shm: {shm/gib:.1f} GiB")
 
 
 def unpermute2d(representation,patch_ids):
@@ -108,6 +112,20 @@ def unpermute2d(representation,patch_ids):
 def unpermute1d(emb,patch_ids):
 	inv = patch_ids.flatten(1).argsort(dim=1)
 	return emb.gather(1,inv[...,None].expand(-1,-1,emb.shape[-1]))
+
+
+################################################################################
+# VALIDATE
+################################################################################
+@torch.no_grad()
+def embedding_std(emb):
+	'''
+	Mean per-dimension std of l2-normalized embeddings, scaled by sqrt(D).
+	~1 for well-spread embeddings, ->0 under collapse.
+	'''
+	# emb is [B,D]
+	emb = torch.nn.functional.normalize(emb.float(),dim=1) #unit-length vectors
+	return (emb.std(dim=0).mean() * emb.shape[1]**0.5) # no SYNC need .item() downstream
 
 
 def load_tract_values(split_tracts_csv,values_csv,n_tracts=0):
@@ -133,7 +151,7 @@ def load_tract_values(split_tracts_csv,values_csv,n_tracts=0):
 
 
 @torch.no_grad()
-def build_table(model,dataloader,device):
+def build_table(model,gpu_norm,dataloader,device):
 
 	embed_dim = model.representation_dim
 	n_tracts  = dataloader.dataset.n_tracts
@@ -151,6 +169,7 @@ def build_table(model,dataloader,device):
 
 		image = image.to(device,non_blocking=True)
 		tract = tract.to(device,non_blocking=True)
+		image = gpu_norm(image)
 
 		with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):
 			rep = model(image)
@@ -170,12 +189,12 @@ def build_table(model,dataloader,device):
 	ids = ids[ids > 0]
 	tract_embedding_table = embeddings[ids] / counts[ids,None]
 
-	# SPREAD OF THE TABLE THE PROBE WILL FIT: ~1 WELL-SPREAD, ->0 UNDER COLLAPSE.
+	# SPREAD OF EMBEDDINGS IN TABLE: ~1 WELL-SPREAD, ->0 UNDER COLLAPSE.
 	# PER-TRACT AND CHIP-AVERAGED, SO NOT ON THE SAME SCALE AS tstd FROM train().
 	std = embedding_std(tract_embedding_table).item()
 
 	# BACK TO 0-BASED tract_index, SO THE CALLER INDEXES load_tract_values() DIRECTLY
-	return (ids - 1).cpu().numpy(),tract_embedding_table.cpu().numpy(),std
+	return (ids - 1).cpu().numpy(),tract_embedding_table.cpu().numpy(),std # >>>>> CPU-GPU SYNC <<<<<
 
 
 def score_probe(X_tr,X_va,Y_tr,Y_va):
@@ -218,17 +237,22 @@ def score_probe(X_tr,X_va,Y_tr,Y_va):
 	return scores, y_hat, probe
 
 
-def train(model,loss_fn,dataloaders,optimizer,scheduler,device):
+################################################################################
+# TRAIN
+################################################################################
+def train(model,gpu_aug,loss_fn,dataloaders,optimizer,scheduler,device):
 
 	sums = torch.zeros(4,device=device)
 	batch_nr = torch.zeros(1,device=device)
 
 	model.train()
-	for X1,X2 in dataloaders['training']: # (X1,ids1),(X2,ids2) for patched+rotated
+	for X in dataloaders['training']: # (X1,ids1),(X2,ids2) for patched+rotated
 
 		#TO DEV
-		X1 = X1.to(device,non_blocking=True)
-		X2 = X2.to(device,non_blocking=True)
+		# X1 = X1.to(device,non_blocking=True)
+		# X2 = X2.to(device,non_blocking=True)
+		X = X.to(device,non_blocking=True)
+		X1,X2 = gpu_aug(X)
 
 		# FORWARD PASS
 		with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):
@@ -254,18 +278,27 @@ def train(model,loss_fn,dataloaders,optimizer,scheduler,device):
 	if scheduler is not None:
 		scheduler.step() #step per epoch
 
-	loss,diag,offd,std = (sums/batch_nr).tolist() # --- GPU-CPU SYNC ---
+	loss,diag,offd,std = (sums/batch_nr).tolist() # >>>>> CPU-GPU SYNC <<<<<
 	print(f'[T] LOSS: {loss:.5f} | ON_DIAG: {diag:.5f} | OFF_DIAG: {offd:.5f} | STD: {std:.5f}')
 	return {'tloss':loss,'tdiag':diag,'toffd':offd,'tstd':std}
 
 
-def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,device):
+################################################################################
+# RUN EPOCHS
+################################################################################
+def train_and_validate(model,gpu_aug,gpu_norm,loss_fn,dataloaders,optimizer,scheduler,epochs,device):
 
 	# LOGGING
 	logger = Logger(f'{LOG_DIR}/epochs_{model.model_id:03}.tsv')
 	chkpt_tracker = RecentBestTracker(n=3)
-	best_epoch = 0
+
+	best_epoch = 0 #by rmse
 	best_rmse = float('inf')
+	best_mae  = float('inf')
+	best_r2   = 0.0
+	best_diag = float('inf')
+	best_offd = 0.0
+
 
 	# HEALTH VALUE PER TRACT ID (Y = tract_values[ids] AFTER build_table)
 	n_tracts = dataloaders['training_labeled'].dataset.n_tracts
@@ -280,7 +313,7 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 
 		# TRAIN
 		train_time_t0 = time.perf_counter()
-		tr_result = train(model,loss_fn,dataloaders,optimizer,scheduler,device)
+		tr_result = train(model,gpu_aug,loss_fn,dataloaders,optimizer,scheduler,device)
 		train_time_t1 = time.perf_counter()
 
 		# EVERY 10 EPOCHS -- VALIDATE: BUILD PER-TRACT EMBEDDINGS, FIT PROBE, PREDICT DIABETES
@@ -288,8 +321,8 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 		if is_eval_epoch:
 
 			# BUILD TRAIN + VALIDATION TABLES
-			ids_t,avg_emb_t,std_t = build_table(model,dataloaders['training_labeled'],device)
-			ids_v,avg_emb_v,std_v = build_table(model,dataloaders['validation'],device)
+			ids_t,avg_emb_t,std_t = build_table(model,gpu_norm,dataloaders['training_labeled'],device)
+			ids_v,avg_emb_v,std_v = build_table(model,gpu_norm,dataloaders['validation'],device)
 
 			# HEALTH VALUES ALIGNED TO TABLE ROWS
 			Y_tr = tract_values[ids_t]
@@ -303,6 +336,7 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 			      f" | STD_TR: {std_t:.5f} | STD_VA: {std_v:.5f}")
 
 		else:
+			#dummy
 			scores = {
 				"rmse":'NaN',
 				"mae": 'NaN',
@@ -325,18 +359,35 @@ def train_and_validate(model,loss_fn,dataloaders,optimizer,scheduler,epochs,devi
 			path = save_checkpoint(MODEL_DIR,model,optimizer,epoch,epoch_results,tag='best')
 			chkpt_tracker.update(path)
 
+		# UPDATE OTHER BEST SCORES
+		if is_eval_epoch:
+			if scores['mae'] < best_mae:
+				best_mae = scores['mae'] 
+			if math.fabs(best_r2) < math.fabs(scores['r2']):
+				best_r2 = scores['r2']
+		if epoch_results['tdiag'] < best_diag:
+			best_diag = epoch_results['tdiag']
+		if best_offd < epoch_results['toffd']:
+			best_offd = epoch_results['toffd']
+
+		# STDOUT LOG EPOCH TIME 
 		epoch_time_t1 = time.perf_counter()
 		print(f"Train time: {train_time_t1-train_time_t0:.2f} secs.")
 		print(f"Epoch time: {epoch_time_t1-epoch_time_t0:.2f} secs.")
 
-	# STDOUT TIME/OVERALL BEST/VRAM
+	# STDOUT LOG OVERALL
 	overall_t1 = time.perf_counter()
 	print(f'Total time: {(overall_t1-overall_t0)/60:.1f} min')
 	print(f'Best epoch: {best_epoch} | rmse: {best_rmse:.5f}')
 	mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
 	print(f'Peak GPU memory allocated: {mem_gb:.2f} GB')
+	print(f'Best mae: {best_mae:.5f}')
+	print(f'Best r2: {best_r2:.5f}')
+	print(f'Best on_diag: {best_diag:.5f} | off_diag: {best_offd:.5f}')
 
-
+################################################################################
+# ARGS/FILE PARSE
+################################################################################
 def load_hyperparameters(args):
 
 	# LOAD FILE
@@ -386,7 +437,9 @@ def parse_args():
 
 	return args
 
-
+################################################################################
+# MAIN/SETUP
+################################################################################
 if __name__ == '__main__':
 	args = parse_args()
 
@@ -426,18 +479,19 @@ if __name__ == '__main__':
 	print("Loaded to RAM! -- ",end='')
 	print(f"{t1_disk_to_ram-t0_disk_to_ram:.2f} secs.")
 
-	# PRINT RAM USAGE -- TODO: PSUTIL NOT INSTALLED IN THE K8S IMAGE
+	# PRINT RAM USAGE
 	pid = os.getpid()
 	python_process = psutil.Process(pid)
 	mem_bytes = python_process.memory_info().rss
 	mem_gb = mem_bytes / (1024 ** 3)
-	print(f"RAM GB USED: {mem_gb}")
+	print(f"RAM USED (GB): {mem_gb}")
 
-
-	train_transform = dataloader.ImageTransform()
+	# train_transform = dataloader.ImageTransform() #CPU
+	gpu_aug = dataloader.GPUImageTransform(crop=192).to(device) #training twin augmentations
+	gpu_norm = dataloader.GPUValidationTransform().to(device) #for validation -- normalize only 
 
 	# DATALOADERS
-	loader_params = {
+	train_loader_params = {
 		'batch_size': hp['batch'],
 		'num_workers': args.num_workers,
 		'pin_memory': True,
@@ -445,12 +499,20 @@ if __name__ == '__main__':
 		'persistent_workers': True
 	}
 
+	val_loader_params = {
+		'batch_size': hp['batch'],
+		'num_workers': 4,
+		'pin_memory': True,
+		'prefetch_factor': 4,
+		'persistent_workers': True
+	}
+
 	# PAIRED + AUGMENTED -- BARLOW TWINS TRAINING
 	t_dload = torch.utils.data.DataLoader(
-		dataset=dataloader.RAMPairedDataset(tr_bands,transform=train_transform,split='train'),
+		dataset=dataloader.RAMPairedDataset(tr_bands,split='train'),
 		shuffle=True,
 		drop_last=True,
-		**loader_params
+		**train_loader_params
 	)
 
 	# LABELED, UNAUGMENTED -- TRAIN TABLE FOR THE PROBE
@@ -458,14 +520,14 @@ if __name__ == '__main__':
 		dataset=dataloader.RAMLabeledDataset(tr_bands,tr_tracts,split='train'),
 		shuffle=False,
 		drop_last=False,
-		**loader_params
+		**val_loader_params
 	)
 
 	v_dload = torch.utils.data.DataLoader(
 		dataset=dataloader.RAMLabeledDataset(va_bands,va_tracts,split='val'),
 		shuffle=False,
 		drop_last=False,
-		**loader_params
+		**val_loader_params
 	)
 
 	dataloaders = {'training': t_dload,'training_labeled': t_dload_labeled,'validation': v_dload}
@@ -479,4 +541,5 @@ if __name__ == '__main__':
 	scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer,schedulers=[warmup_sched,cosine_sched],milestones=[warmup_steps])
 
 	# TRAIN AND VALIDATE
-	train_and_validate(bt_net,loss_fn,dataloaders,optimizer,scheduler,epochs,device)
+	train_and_validate(bt_net,gpu_aug,gpu_norm,loss_fn,dataloaders,optimizer,scheduler,epochs,device)
+
