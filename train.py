@@ -9,7 +9,7 @@ import csv
 import sys
 import psutil
 import shutil
-import math
+# import math
 
 from scipy.stats import spearmanr
 from sklearn.linear_model import RidgeCV
@@ -295,9 +295,9 @@ def train_and_validate(model,gpu_aug,gpu_norm,loss_fn,dataloaders,optimizer,sche
 	best_epoch = 0 #by rmse
 	best_rmse = float('inf')
 	best_mae  = float('inf')
-	best_r2   = 0.0
+	best_r2   = float('-inf')
 	best_diag = float('inf')
-	best_offd = 0.0
+	best_offd = float('inf')
 
 
 	# HEALTH VALUE PER TRACT ID (Y = tract_values[ids] AFTER build_table)
@@ -363,11 +363,11 @@ def train_and_validate(model,gpu_aug,gpu_norm,loss_fn,dataloaders,optimizer,sche
 		if is_eval_epoch:
 			if scores['mae'] < best_mae:
 				best_mae = scores['mae'] 
-			if math.fabs(best_r2) < math.fabs(scores['r2']):
+			if best_r2 < scores['r2']:
 				best_r2 = scores['r2']
 		if epoch_results['tdiag'] < best_diag:
 			best_diag = epoch_results['tdiag']
-		if best_offd < epoch_results['toffd']:
+		if epoch_results['toffd'] < best_offd:
 			best_offd = epoch_results['toffd']
 
 		# STDOUT LOG EPOCH TIME 
