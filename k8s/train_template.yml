@@ -22,14 +22,14 @@ spec:
 
         resources:
           limits:
-            memory: 128Gi
+            memory: 80Gi
             cpu: 8
-            ephemeral-storage: 60Gi
+            ephemeral-storage: 50Gi
             nvidia.com/a100: 1
           requests:
-            memory: 128Gi
+            memory: 80Gi
             cpu: 8
-            ephemeral-storage: 60Gi
+            ephemeral-storage: 50Gi
             nvidia.com/a100: 1
 
         env:
