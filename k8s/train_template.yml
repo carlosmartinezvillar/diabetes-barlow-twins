@@ -43,7 +43,7 @@ spec:
         command: ["/bin/sh","-c"]
         args:
           - |
-            git clone https://github.com/carlosmartinezvillar/diabetes-barlow-twins && cd diabetes-barlow-twins && bash ./k8s/train.sh
+            git clone https://github.com/carlosmartinezvillar/diabetes-barlow-twins && cd diabetes-barlow-twins && exec bash ./k8s/train.sh
 
         volumeMounts:
         - mountPath: /chips_pvc

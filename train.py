@@ -7,6 +7,7 @@ import argparse
 import json
 import csv
 import sys
+import psutil
 
 from scipy.stats import spearmanr
 from sklearn.linear_model import RidgeCV
