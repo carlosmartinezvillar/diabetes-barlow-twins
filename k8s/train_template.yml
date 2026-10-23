@@ -28,7 +28,7 @@ spec:
             nvidia.com/a100: 1
           requests:
             memory: 80Gi
-            cpu: t
+            cpu: 6
             ephemeral-storage: 50Gi
             nvidia.com/a100: 1
 
