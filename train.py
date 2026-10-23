@@ -495,15 +495,15 @@ if __name__ == '__main__':
 		'batch_size': hp['batch'],
 		'num_workers': args.num_workers,
 		'pin_memory': True,
-		'prefetch_factor': 4,
+		'prefetch_factor': 6,
 		'persistent_workers': True
 	}
 
 	val_loader_params = {
 		'batch_size': hp['batch'],
-		'num_workers': 4,
+		'num_workers': args.num_workers,
 		'pin_memory': True,
-		'prefetch_factor': 4,
+		'prefetch_factor': 6,
 		'persistent_workers': True
 	}
 
